@@ -80,7 +80,7 @@ def create_task(token, user_id, list_id, task_name, category):
 
 
 # --- Task Chain: Combined GET (validation) and POST (notification) handler ---
-@app.route(route="taskchain", methods=["GET", "POST"])
+@app.route(route="taskchain", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     """
     Why: Azure Functions does not allow two separate functions to share
