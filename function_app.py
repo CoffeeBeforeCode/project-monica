@@ -4,12 +4,12 @@
 
 import azure.functions as func
 import logging
-
-app = func.FunctionApp()
-
 import json
 import os
 import requests
+
+app = func.FunctionApp()
+
 
 # --- Authentication ---
 def get_access_token():
@@ -79,40 +79,35 @@ def create_task(token, user_id, list_id, task_name, category):
     return response.status_code, response.json()
 
 
-# --- Webhook Validation ---
-@app.route(route="taskchain", methods=["GET"])
-def webhook_validation(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Why: Microsoft Graph requires a validation handshake before it will
-    register a webhook subscription. When Graph sends a GET request with
-    a validationToken, we must return it as plain text within 10 seconds.
-    Without this, the subscription registration fails.
-    """
-    validation_token = req.params.get("validationToken")
-    if validation_token:
-        logging.info("Webhook validation request received - responding with token")
-        return func.HttpResponse(
-            validation_token,
-            status_code=200,
-            mimetype="text/plain"
-        )
-
-
-# --- Task Chain: Main Function ---
-@app.route(route="taskchain", methods=["POST"])
+# --- Task Chain: Combined GET (validation) and POST (notification) handler ---
+@app.route(route="taskchain", methods=["GET", "POST"])
 def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Why: This is the function Graph calls when a task is completed in
-    Microsoft To Do. It reads the chain rules from OneDrive, checks whether
-    the completed task has a defined successor, and creates it automatically.
-    Phillip marks one task complete; Monica creates the next one silently.
+    Why: Azure Functions does not allow two separate functions to share
+    the same route. The GET and POST handlers must be combined into one
+    function that checks the HTTP method and responds appropriately.
+    GET handles Graph's validation handshake - required before a webhook
+    subscription can be registered.
+    POST handles the actual task completion notifications from Graph.
     """
-    logging.info("taskChain function triggered")
 
+    # --- GET: Webhook validation handshake ---
+    if req.method == "GET":
+        validation_token = req.params.get("validationToken")
+        if validation_token:
+            logging.info("Webhook validation request received - responding with token")
+            return func.HttpResponse(
+                validation_token,
+                status_code=200,
+                mimetype="text/plain"
+            )
+        return func.HttpResponse("No validation token", status_code=400)
+
+    # --- POST: Task completion notification ---
+    logging.info("taskChain function triggered")
     user_id = "cda66539-6f2a-4a27-a5a3-a493061f8711"
 
     try:
-        # Step 1: Get the completed task title from the webhook payload
         body = req.get_json()
         notifications = body.get("value", [])
 
@@ -120,13 +115,9 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             resource = notification.get("resource", "")
             logging.info(f"Notification received for resource: {resource}")
 
-            # Step 2: Authenticate with Graph API via Managed Identity
             token = get_access_token()
-
-            # Step 3: Load task chain rules from OneDrive
             chains = get_task_chains(token)
 
-            # Step 4: Retrieve the completed task details
             task_url = f"https://graph.microsoft.com/v1.0/{resource}"
             headers = {"Authorization": f"Bearer {token}"}
             task_response = requests.get(task_url, headers=headers)
@@ -134,18 +125,13 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             completed_title = task.get("title", "")
             logging.info(f"Completed task title: {completed_title}")
 
-            # Step 5: Check for a matching chain rule
             for chain in chains:
                 if chain["trigger_task"] == completed_title:
                     logging.info(f"Chain match found: {chain['creates_task']}")
-
-                    # Step 6: Find the target list ID
                     list_id = get_list_id(token, user_id, chain["list"])
                     if not list_id:
                         logging.error(f"List not found: {chain['list']}")
                         continue
-
-                    # Step 7: Create the successor task
                     status, result = create_task(
                         token,
                         user_id,
