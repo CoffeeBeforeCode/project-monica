@@ -58,6 +58,21 @@ def get_list_id(token, user_id, list_name):
     return None
 
 
+# --- To Do: Get recently completed tasks from a list ---
+def get_completed_tasks(token, user_id, list_id):
+    """
+    Why: Graph's webhook notification tells us which list changed but sends
+    the resource path in an internal format that cannot be used directly.
+    Instead of trying to fetch a specific task from that path, we query
+    the list for all completed tasks and check each one against the chain
+    rules. This is reliable regardless of how Graph formats the notification.
+    """
+    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks?$filter=status eq 'completed'"
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(url, headers=headers)
+    return response.json().get("value", [])
+
+
 # --- To Do: Create successor task ---
 def create_task(token, user_id, list_id, task_name, category):
     """
@@ -109,35 +124,51 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
         body = req.get_json()
         notifications = body.get("value", [])
 
+        token = get_access_token()
+        chains = get_task_chains(token)
+
         for notification in notifications:
             resource = notification.get("resource", "")
             logging.info(f"Notification received for resource: {resource}")
 
-            token = get_access_token()
-            chains = get_task_chains(token)
+            # Extract the list ID from the resource path
+            # Why: The list ID appears between single quotes after 'lists('
+            # We extract it here to query the list directly rather than
+            # using the internal resource path which cannot be fetched directly.
+            import re
+            list_id_match = re.search(r"lists\('([^']+)'\)", resource)
+            if not list_id_match:
+                logging.error("Could not extract list ID from resource path")
+                continue
 
-            task_url = f"https://graph.microsoft.com/v1.0/{resource}"
-            headers = {"Authorization": f"Bearer {token}"}
-            task_response = requests.get(task_url, headers=headers)
-            task = task_response.json()
-            completed_title = task.get("title", "")
-            logging.info(f"Completed task title: {completed_title}")
+            list_id = list_id_match.group(1)
+            logging.info(f"Querying list ID: {list_id}")
 
-            for chain in chains:
-                if chain["trigger_task"] == completed_title:
-                    logging.info(f"Chain match found: {chain['creates_task']}")
-                    list_id = get_list_id(token, user_id, chain["list"])
-                    if not list_id:
-                        logging.error(f"List not found: {chain['list']}")
-                        continue
-                    status, result = create_task(
-                        token,
-                        user_id,
-                        list_id,
-                        chain["creates_task"],
-                        chain["category"]
-                    )
-                    logging.info(f"Successor task created: {chain['creates_task']} - Status: {status}")
+            # Query the list for completed tasks
+            completed_tasks = get_completed_tasks(token, user_id, list_id)
+            logging.info(f"Found {len(completed_tasks)} completed tasks in list")
+
+            for task in completed_tasks:
+                completed_title = task.get("title", "")
+                logging.info(f"Checking completed task: {completed_title}")
+
+                for chain in chains:
+                    if chain["trigger_task"] == completed_title:
+                        logging.info(f"Chain match found: {chain['creates_task']}")
+
+                        target_list_id = get_list_id(token, user_id, chain["list"])
+                        if not target_list_id:
+                            logging.error(f"Target list not found: {chain['list']}")
+                            continue
+
+                        status, result = create_task(
+                            token,
+                            user_id,
+                            target_list_id,
+                            chain["creates_task"],
+                            chain["category"]
+                        )
+                        logging.info(f"Successor task created: {chain['creates_task']} - Status: {status}")
 
         return func.HttpResponse("OK", status_code=200)
 
