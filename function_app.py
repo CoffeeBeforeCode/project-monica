@@ -7,8 +7,10 @@ import logging
 import json
 import os
 import requests
+from webhook_renewal import bp as renewal_bp
 
 app = func.FunctionApp()
+app.register_functions(renewal_bp)
 
 
 # --- Authentication ---
