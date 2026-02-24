@@ -8,10 +8,8 @@ import json
 import os
 import re
 import requests
-from webhook_renewal import bp as renewal_bp
 
 app = func.FunctionApp()
-app.register_functions(renewal_bp)
 
 
 # --- Authentication ---
@@ -83,9 +81,7 @@ def task_exists(token, user_id, list_id, task_name):
     Without this check, Monica would create duplicate successor tasks — one for
     each notification received. This function queries the target list for any
     task whose title matches the successor task name. If one already exists,
-    Monica skips creation and logs the skip instead. The check covers both
-    active and completed tasks so that recently completed successors are also
-    caught.
+    Monica skips creation and logs the skip instead.
     """
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks"
     headers = {"Authorization": f"Bearer {token}"}
@@ -127,10 +123,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     a POST, not a GET as might be expected. Checking for the token first
     means both validation and task notifications are handled correctly.
     """
-
-    # --- Validation handshake (GET or POST) ---
-    # Why: Graph may send the validation request as either method.
-    # Checking for the token parameter first handles both cases safely.
     validation_token = req.params.get("validationToken")
     if validation_token:
         logging.info("Webhook validation request received - responding with token")
@@ -140,7 +132,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="text/plain"
         )
 
-    # --- POST: Task completion notification ---
     logging.info("taskChain function triggered")
     user_id = "cda66539-6f2a-4a27-a5a3-a493061f8711"
 
@@ -155,10 +146,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             resource = notification.get("resource", "")
             logging.info(f"Notification received for resource: {resource}")
 
-            # Extract the list ID from the resource path
-            # Why: The list ID appears between single quotes after 'lists('
-            # We extract it here to query the list directly rather than
-            # using the internal resource path which cannot be fetched directly.
             list_id_match = re.search(r"lists\('([^']+)'\)", resource)
             if not list_id_match:
                 logging.error("Could not extract list ID from resource path")
@@ -167,7 +154,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             list_id = list_id_match.group(1)
             logging.info(f"Querying list ID: {list_id}")
 
-            # Query the list for completed tasks
             completed_tasks = get_completed_tasks(token, user_id, list_id)
             logging.info(f"Found {len(completed_tasks)} completed tasks in list")
 
@@ -184,10 +170,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
                             logging.error(f"Target list not found: {chain['list']}")
                             continue
 
-                        # --- Deduplication check ---
-                        # Why: Graph often sends multiple notifications for a single
-                        # task completion. Check whether the successor task already
-                        # exists before creating it. If it does, skip and log.
                         if task_exists(token, user_id, target_list_id, chain["creates_task"]):
                             logging.info(f"Successor task already exists, skipping: {chain['creates_task']}")
                             continue
@@ -210,4 +192,4 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
 
 Commit with:
 ```
-Session 7: deduplication added — Monica checks for existing successor task before creating
+Session 7: Blueprint import temporarily removed — diagnosing 404
