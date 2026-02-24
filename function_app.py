@@ -79,29 +79,27 @@ def create_task(token, user_id, list_id, task_name, category):
     return response.status_code, response.json()
 
 
-# --- Task Chain: Combined GET (validation) and POST (notification) handler ---
+# --- Task Chain: Combined validation and notification handler ---
 @app.route(route="taskchain", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Why: Azure Functions does not allow two separate functions to share
-    the same route. The GET and POST handlers must be combined into one
-    function that checks the HTTP method and responds appropriately.
-    GET handles Graph's validation handshake - required before a webhook
-    subscription can be registered.
-    POST handles the actual task completion notifications from Graph.
+    Why: The validationToken check must happen before anything else,
+    regardless of HTTP method. Graph sends its validation handshake as
+    a POST, not a GET as might be expected. Checking for the token first
+    means both validation and task notifications are handled correctly.
     """
 
-    # --- GET: Webhook validation handshake ---
-    if req.method == "GET":
-        validation_token = req.params.get("validationToken")
-        if validation_token:
-            logging.info("Webhook validation request received - responding with token")
-            return func.HttpResponse(
-                validation_token,
-                status_code=200,
-                mimetype="text/plain"
-            )
-        return func.HttpResponse("No validation token", status_code=400)
+    # --- Validation handshake (GET or POST) ---
+    # Why: Graph may send the validation request as either method.
+    # Checking for the token parameter first handles both cases safely.
+    validation_token = req.params.get("validationToken")
+    if validation_token:
+        logging.info("Webhook validation request received - responding with token")
+        return func.HttpResponse(
+            validation_token,
+            status_code=200,
+            mimetype="text/plain"
+        )
 
     # --- POST: Task completion notification ---
     logging.info("taskChain function triggered")
