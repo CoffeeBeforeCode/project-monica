@@ -1,4 +1,3 @@
-@'
 {
   "version": "2.0",
   "extensionBundle": {
@@ -13,4 +12,3 @@
     }
   }
 }
-'@ | Set-Content host.json
