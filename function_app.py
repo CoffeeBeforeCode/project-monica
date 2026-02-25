@@ -4,7 +4,6 @@
 
 import azure.functions as func
 import logging
-import json
 import os
 import re
 import requests
@@ -17,7 +16,7 @@ app = func.FunctionApp()
 # across multiple files while keeping a single FunctionApp instance. Without this
 # import and registration, the runtime finds an unregistered Blueprint and crashes
 # on startup before it can bind any triggers — including taskChain. This was
-# temporarily removed in Session 7 as a diagnostic step and must be restored.
+# temporarily removed in Session 7 as a diagnostic step and is restored here.
 from webhook_renewal import bp
 app.register_blueprint(bp)
 
@@ -198,8 +197,3 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"taskChain error: {str(e)}")
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
-```
-
-Commit it with the message:
-```
-Session 8: Restore Blueprint import — fix host crash on startup
