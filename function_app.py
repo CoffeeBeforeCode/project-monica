@@ -11,6 +11,16 @@ import requests
 
 app = func.FunctionApp()
 
+# --- Blueprint Registration ---
+# Why: The renewWebhookSubscriptions Timer Trigger is defined in webhook_renewal.py
+# using the Azure Functions Blueprint pattern. A Blueprint lets us organise functions
+# across multiple files while keeping a single FunctionApp instance. Without this
+# import and registration, the runtime finds an unregistered Blueprint and crashes
+# on startup before it can bind any triggers — including taskChain. This was
+# temporarily removed in Session 7 as a diagnostic step and must be restored.
+from webhook_renewal import bp
+app.register_blueprint(bp)
+
 
 # --- Authentication ---
 def get_access_token():
@@ -190,6 +200,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
 ```
 
-Commit with:
+Commit it with the message:
 ```
-Session 7: Blueprint import temporarily removed — diagnosing 404
+Session 8: Restore Blueprint import — fix host crash on startup
