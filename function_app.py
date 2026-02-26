@@ -85,22 +85,42 @@ def get_completed_tasks(token, user_id, list_id):
     return response.json().get("value", [])
 
 
-# --- To Do: Check whether a task already exists in a list ---
+# --- To Do: Check whether a task already exists in a list today ---
 def task_exists(token, user_id, list_id, task_name):
     """
     Why: Graph sends multiple notifications for a single task completion event.
-    Without this check, Monica would create duplicate successor tasks — one for
-    each notification received. This function queries the target list for any
-    task whose title matches the successor task name. If one already exists,
-    Monica skips creation and logs the skip instead.
+    Without this check, Monica would create duplicate successor tasks.
+
+    The check is scoped to tasks created today in UTC. This prevents two
+    problems:
+      1. A completed Dry task from a previous day blocking today's creation.
+      2. Duplicate successor tasks when multiple notifications arrive at once.
+
+    We fetch all tasks in the target list and filter client-side by
+    createdDateTime, because the To Do API does not support server-side
+    filtering on that field. Any task with today's date in UTC whose title
+    matches the successor name counts as already existing.
     """
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks"
     headers = {"Authorization": f"Bearer {token}"}
     response = requests.get(url, headers=headers)
     tasks = response.json().get("value", [])
+
+    today_utc = datetime.now(timezone.utc).date()
+
     for task in tasks:
-        if task.get("title", "") == task_name:
+        if task.get("title", "") != task_name:
+            continue
+        created_raw = task.get("createdDateTime", "")
+        try:
+            created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            if created_dt.date() == today_utc:
+                return True
+        except Exception:
+            # Why: If the date cannot be parsed, assume the task exists to be safe
+            # and avoid creating a duplicate.
             return True
+
     return False
 
 
@@ -167,6 +187,13 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
         token = get_access_token()
         chains = get_task_chains(token)
 
+        # Why: Graph sometimes batches multiple notifications for the same list
+        # into a single POST, or fires separate POSTs in very quick succession.
+        # Deduplicating by list ID here ensures each list is only processed once
+        # per webhook call, eliminating the most common source of duplicate
+        # successor tasks without needing an external lock.
+        seen_list_ids = set()
+
         for notification in notifications:
             resource = notification.get("resource", "")
             logging.info(f"Notification received for resource: {resource}")
@@ -177,6 +204,12 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
                 continue
 
             list_id = list_id_match.group(1)
+
+            if list_id in seen_list_ids:
+                logging.info(f"List ID {list_id} already processed in this call, skipping duplicate notification")
+                continue
+            seen_list_ids.add(list_id)
+
             logging.info(f"Querying list ID: {list_id}")
 
             completed_tasks = get_completed_tasks(token, user_id, list_id)
@@ -196,7 +229,7 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
                             continue
 
                         if task_exists(token, user_id, target_list_id, chain["creates_task"]):
-                            logging.info(f"Successor task already exists, skipping: {chain['creates_task']}")
+                            logging.info(f"Successor task already exists today, skipping: {chain['creates_task']}")
                             continue
 
                         due_time = chain.get("due_time")
