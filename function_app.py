@@ -7,18 +7,20 @@ import logging
 import os
 import re
 import requests
+from datetime import datetime, timezone
 
 app = func.FunctionApp()
 
 # --- Blueprint Registration ---
-# Why: The renewWebhookSubscriptions Timer Trigger is defined in webhook_renewal.py
-# using the Azure Functions Blueprint pattern. A Blueprint lets us organise functions
-# across multiple files while keeping a single FunctionApp instance. Without this
-# import and registration, the runtime finds an unregistered Blueprint and crashes
-# on startup before it can bind any triggers — including taskChain. This was
-# temporarily removed in Session 7 as a diagnostic step and is restored here.
+# Why: Both renewWebhookSubscriptions and the task creator Timer Triggers are
+# defined in separate files using the Blueprint pattern. Registering them here
+# makes all their triggers visible to the single FunctionApp instance. Without
+# registration the runtime finds orphaned Blueprints and crashes on startup.
 from webhook_renewal import bp
 app.register_blueprint(bp)
+
+from task_creator import bp_creator
+app.register_blueprint(bp_creator)
 
 
 # --- Authentication ---
@@ -103,12 +105,13 @@ def task_exists(token, user_id, list_id, task_name):
 
 
 # --- To Do: Create successor task ---
-def create_task(token, user_id, list_id, task_name, category):
+def create_task(token, user_id, list_id, task_name, category, due_time=None):
     """
-    Why: This is Monica's core action - creating the successor task
-    in the correct list with the correct domain category applied.
-    Task naming follows the Founding Specification convention exactly:
-    Verb: Activity beginning with a capital letter.
+    Why: Creates the successor task in the correct list with the correct category.
+    The optional due_time parameter accepts a "HH:MM" string. When present, Monica
+    sets the task due date to today at that time in UTC, so Dry tasks appear at
+    19:00 on the same day the Wash task was completed rather than floating
+    with no due date.
     """
     url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks"
     headers = {
@@ -119,6 +122,19 @@ def create_task(token, user_id, list_id, task_name, category):
         "title": task_name,
         "categories": [category]
     }
+
+    if due_time:
+        try:
+            hour, minute = map(int, due_time.split(":"))
+            now = datetime.now(timezone.utc)
+            due_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            body["dueDateTime"] = {
+                "dateTime": due_dt.strftime("%Y-%m-%dT%H:%M:%S.0000000"),
+                "timeZone": "UTC"
+            }
+        except Exception as e:
+            logging.warning(f"Could not parse due_time '{due_time}': {e}")
+
     response = requests.post(url, headers=headers, json=body)
     return response.status_code, response.json()
 
@@ -183,12 +199,14 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
                             logging.info(f"Successor task already exists, skipping: {chain['creates_task']}")
                             continue
 
+                        due_time = chain.get("due_time")
                         status, result = create_task(
                             token,
                             user_id,
                             target_list_id,
                             chain["creates_task"],
-                            chain["category"]
+                            chain["category"],
+                            due_time=due_time
                         )
                         logging.info(f"Successor task created: {chain['creates_task']} - Status: {status}")
 
