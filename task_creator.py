@@ -262,3 +262,11 @@ def createMonthlyTasks(timer: func.TimerRequest) -> None:
     today = today_utc_at(5, 0)
     create_todo_task(token, "Audit: Credit Score (Chase/Discover)", "[00] System", due_utc=today)
     create_todo_task(token, "Update: Financial Position",           "[00] System", due_utc=today)
+
+@bp_creator.timer_trigger(
+    arg_name="timer",
+    schedule="0 */4 * * * *",
+    run_on_startup=False
+)
+def keepAlive(timer: func.TimerRequest) -> None:
+    logging.info("Keep-alive ping: host is warm.")
