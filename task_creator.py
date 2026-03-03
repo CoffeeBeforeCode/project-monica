@@ -1,3 +1,4 @@
+@@ -0,0 +1,264 @@
 # task_creator.py
 # Why: All scheduled task creation lives here, separate from the webhook handler
 # in function_app.py. Using a Blueprint keeps each concern in its own file
@@ -81,24 +82,6 @@ def today_utc_at(hour: int, minute: int = 0) -> datetime:
     """
     now = datetime.now(timezone.utc)
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-
-
-# --- Keep-Alive 4-minute Timer ---
-# Why: The Consumption plan cold-starts the host if it has been idle for
-# several minutes. When the host is cold at 05:00 UTC, all Timer Triggers
-# scheduled for that minute fire into a sleeping process and are silently
-# lost. Firing every 4 minutes keeps the host warm so all scheduled
-# triggers land reliably.
-# Fix note: schedule and arg_name must follow the same parameter order
-# as all other decorators in this file — the Azure Functions v2 runtime
-# is sensitive to this order during function discovery.
-@bp_creator.timer_trigger(
-    schedule="0 */4 * * * *",
-    arg_name="timer",
-    run_on_startup=False
-)
-def keepAlive(timer: func.TimerRequest) -> None:
-    logging.info("Keep-alive ping: host is warm.")
 
 
 # --- Daily 05:00 UTC Timer ---
