@@ -83,6 +83,24 @@ def today_utc_at(hour: int, minute: int = 0) -> datetime:
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
+# --- Keep-Alive 4-minute Timer ---
+# Why: The Consumption plan cold-starts the host if it has been idle for
+# several minutes. When the host is cold at 05:00 UTC, all Timer Triggers
+# scheduled for that minute fire into a sleeping process and are silently
+# lost. Firing every 4 minutes keeps the host warm so all scheduled
+# triggers land reliably.
+# Fix note: schedule and arg_name must follow the same parameter order
+# as all other decorators in this file — the Azure Functions v2 runtime
+# is sensitive to this order during function discovery.
+@bp_creator.timer_trigger(
+    schedule="0 */4 * * * *",
+    arg_name="timer",
+    run_on_startup=False
+)
+def keepAlive(timer: func.TimerRequest) -> None:
+    logging.info("Keep-alive ping: host is warm.")
+
+
 # --- Daily 05:00 UTC Timer ---
 # Why: Creates the four morning tasks every day at 05:00 UTC.
 # First: Make the Bed is given a due time of 04:00 UTC so it sorts
@@ -262,11 +280,3 @@ def createMonthlyTasks(timer: func.TimerRequest) -> None:
     today = today_utc_at(5, 0)
     create_todo_task(token, "Audit: Credit Score (Chase/Discover)", "[00] System", due_utc=today)
     create_todo_task(token, "Update: Financial Position",           "[00] System", due_utc=today)
-
-@bp_creator.timer_trigger(
-    arg_name="timer",
-    schedule="0 */4 * * * *",
-    run_on_startup=False
-)
-def keepAlive(timer: func.TimerRequest) -> None:
-    logging.info("Keep-alive ping: host is warm.")
