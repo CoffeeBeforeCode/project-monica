@@ -1,245 +1,268 @@
-# Project Monica - Function App
-# Main entry point for all Azure Functions
-# Python 3.12 / Azure Functions v2 programming model
-
 import azure.functions as func
 import logging
-import os
-import re
+import json
 import requests
+import os
 from datetime import datetime, timezone
 
-app = func.FunctionApp()
+# Why: Blueprint imports pull in the Timer Trigger functions defined in
+# separate files. The Python v2 programming model requires all functions
+# to be registered under a single FunctionApp instance — Blueprints allow
+# the code to be split across files while still satisfying that requirement.
+from webhook_renewal import bp as bp_renewal
+from task_creator import bp as bp_creator
 
-# --- Blueprint Registration ---
-# Why: Both renewWebhookSubscriptions and the task creator Timer Triggers are
-# defined in separate files using the Blueprint pattern. Registering them here
-# makes all their triggers visible to the single FunctionApp instance. Without
-# registration the runtime finds orphaned Blueprints and crashes on startup.
-from webhook_renewal import bp
-app.register_blueprint(bp)
+# Why: FunctionApp is the root object for the Python v2 programming model.
+# ANONYMOUS auth level is required because Graph webhook notifications
+# cannot pass function keys in their requests — the endpoints must be
+# publicly reachable without a key.
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-from task_creator import bp_creator
+# Why: Register the Blueprint modules so the runtime discovers their
+# Timer Trigger functions alongside the HTTP Triggers defined below.
+app.register_blueprint(bp_renewal)
 app.register_blueprint(bp_creator)
 
 
-# --- Authentication ---
-def get_access_token():
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+USER_ID = "cda66539-6f2a-4a27-a5a3-a493061f8711"
+
+LIST_IDS = {
+    "Admin":          "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA=",
+    "Deep":           "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBJAAA=",
+    "Home":           "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA=",
+    "Inbox":          "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG3VT6_AAA=",
+    "Out":            "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBMAAA=",
+    "Some Day/Maybe": "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG3VT7GAAA=",
+    "Waiting For":    "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG3VT7FAAA=",
+}
+
+TASK_CHAINS_PATH = "/[00] Systems/Infrastructure/Monica/config/task-chains.json"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_access_token() -> str:
     """
-    Why: The Function App uses Managed Identity to authenticate with Microsoft Graph.
-    This means no credentials in code - Azure handles the token automatically.
-    IDENTITY_ENDPOINT and IDENTITY_HEADER are injected by Azure at runtime.
+    Why: Obtains a Graph API bearer token via Managed Identity. Azure injects
+    IDENTITY_ENDPOINT and IDENTITY_HEADER at runtime — no credentials are stored
+    in code or environment variables. The token is scoped to the permissions
+    granted to the Managed Identity: Tasks.ReadWrite.All and Files.Read.All.
     """
-    identity_endpoint = os.environ["IDENTITY_ENDPOINT"]
-    identity_header = os.environ["IDENTITY_HEADER"]
-    token_url = f"{identity_endpoint}?resource=https://graph.microsoft.com&api-version=2019-08-01"
-    headers = {"X-IDENTITY-HEADER": identity_header}
-    response = requests.get(token_url, headers=headers)
+    endpoint = os.environ["IDENTITY_ENDPOINT"]
+    header   = os.environ["IDENTITY_HEADER"]
+    url = f"{endpoint}?api-version=2019-08-01&resource=https://graph.microsoft.com"
+    response = requests.get(url, headers={"X-IDENTITY-HEADER": header})
+    response.raise_for_status()
     return response.json()["access_token"]
 
 
-# --- OneDrive: Read task-chains.json ---
-def get_task_chains(token):
+def get_task_chains(token: str) -> list:
     """
-    Why: Task chain rules live in a human-readable JSON file in OneDrive,
-    not hardcoded in the function. This means Phillip can add new chains
-    by editing a file - no code deployment required.
+    Why: Reads task-chains.json from OneDrive via Graph API. Storing chains
+    in OneDrive means they can be updated without a code deployment — Monica
+    picks up changes on the next webhook notification automatically.
     """
-    drive_id = "b!P6rMZy1cnUiuZLBDURE_GkKIGD_9euVDsIfqU_9bzzdFt7Iel1D4SY7FwvJum6B5"
-    file_path = "[00] Systems/Infrastructure/Monica/config/task-chains.json"
-    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{file_path}:/content"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{USER_ID}"
+        f"/drive/root:{TASK_CHAINS_PATH}:/content"
+    )
+    response = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+    response.raise_for_status()
     return response.json()
 
 
-# --- To Do: Get list ID by name ---
-def get_list_id(token, user_id, list_name):
+def get_list_id(list_name: str) -> str | None:
     """
-    Why: Graph API requires a list ID, not a list name. This function
-    translates the human-readable name in task-chains.json into the
-    ID Microsoft To Do needs to create the task in the right place.
+    Why: Translates a human-readable list name from task-chains.json into
+    the stable Graph API list ID. Returns None for unrecognised names so
+    the caller can skip gracefully rather than crash.
     """
-    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    lists = response.json().get("value", [])
-    for lst in lists:
-        if lst["displayName"] == list_name:
-            return lst["id"]
-    return None
+    return LIST_IDS.get(list_name)
 
 
-# --- To Do: Get completed tasks from a list ---
-def get_completed_tasks(token, user_id, list_id):
+def task_exists(token: str, list_id: str, title: str) -> bool:
     """
-    Why: Graph's webhook notification tells us which list changed but sends
-    the resource path in an internal format that cannot be used directly.
-    Instead of trying to fetch a specific task from that path, we query
-    the list for all completed tasks and check each one against the chain
-    rules. This is reliable regardless of how Graph formats the notification.
+    Why: Checks whether a task with the given title already exists in the
+    target list, scoped to tasks created today. Graph often sends multiple
+    notifications for a single completion event — without this guard Monica
+    would create duplicate successor tasks. Scoping to today prevents false
+    positives from recurring tasks that share a title across days.
     """
-    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks?$filter=status eq 'completed'"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    return response.json().get("value", [])
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{USER_ID}"
+        f"/todo/lists/{list_id}/tasks"
+        f"?$filter=title eq '{title}'"
+        f" and createdDateTime ge {today}T00:00:00Z"
+    )
+    response = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+    if response.status_code != 200:
+        logging.warning(
+            f"task_exists check failed with {response.status_code} — "
+            "assuming task does not exist to avoid blocking chain"
+        )
+        return False
+    return len(response.json().get("value", [])) > 0
 
 
-# --- To Do: Check whether a task already exists in a list today ---
-def task_exists(token, user_id, list_id, task_name):
+def create_task(
+    token: str,
+    list_id: str,
+    title: str,
+    category: str = None,
+    due_time: str = None
+) -> dict:
     """
-    Why: Graph sends multiple notifications for a single task completion event.
-    Without this check, Monica would create duplicate successor tasks.
-
-    The check is scoped to tasks created today in UTC. This prevents two
-    problems:
-      1. A completed Dry task from a previous day blocking today's creation.
-      2. Duplicate successor tasks when multiple notifications arrive at once.
-
-    We fetch all tasks in the target list and filter client-side by
-    createdDateTime, because the To Do API does not support server-side
-    filtering on that field. Any task with today's date in UTC whose title
-    matches the successor name counts as already existing.
+    Why: Creates a successor task in the specified To Do list via Graph API.
+    - category sets the named colour label in To Do (e.g. "Home", "Admin"),
+      which matches the GTD context system.
+    - due_time is an optional HH:MM string (UTC). When present it sets the
+      task's due date to today at that time — used for Dry tasks so they
+      surface at 19:00 on the day the Wash task is completed, not at midnight.
     """
-    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks"
-    headers = {"Authorization": f"Bearer {token}"}
-    response = requests.get(url, headers=headers)
-    tasks = response.json().get("value", [])
+    body: dict = {"title": title}
 
-    today_utc = datetime.now(timezone.utc).date()
-
-    for task in tasks:
-        if task.get("title", "") != task_name:
-            continue
-        created_raw = task.get("createdDateTime", "")
-        try:
-            created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
-            if created_dt.date() == today_utc:
-                return True
-        except Exception:
-            # Why: If the date cannot be parsed, assume the task exists to be safe
-            # and avoid creating a duplicate.
-            return True
-
-    return False
-
-
-# --- To Do: Create successor task ---
-def create_task(token, user_id, list_id, task_name, category, due_time=None):
-    """
-    Why: Creates the successor task in the correct list with the correct category.
-    The optional due_time parameter accepts a "HH:MM" string. When present, Monica
-    sets the task due date to today at that time in UTC, so Dry tasks appear at
-    19:00 on the same day the Wash task was completed rather than floating
-    with no due date.
-    """
-    url = f"https://graph.microsoft.com/v1.0/users/{user_id}/todo/lists/{list_id}/tasks"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "title": task_name,
-        "categories": [category]
-    }
+    if category:
+        body["categories"] = [category]
 
     if due_time:
-        try:
-            hour, minute = map(int, due_time.split(":"))
-            now = datetime.now(timezone.utc)
-            due_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            body["dueDateTime"] = {
-                "dateTime": due_dt.strftime("%Y-%m-%dT%H:%M:%S.0000000"),
-                "timeZone": "UTC"
-            }
-        except Exception as e:
-            logging.warning(f"Could not parse due_time '{due_time}': {e}")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        body["dueDateTime"] = {
+            "dateTime": f"{today}T{due_time}:00",
+            "timeZone": "UTC"
+        }
 
-    response = requests.post(url, headers=headers, json=body)
-    return response.status_code, response.json()
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{USER_ID}"
+        f"/todo/lists/{list_id}/tasks"
+    )
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
+        json=body
+    )
+    response.raise_for_status()
+    return response.json()
 
 
-# --- Task Chain: Combined validation and notification handler ---
-@app.route(route="taskchain", methods=["GET", "POST"], auth_level=func.AuthLevel.ANONYMOUS)
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP TRIGGER — taskChain
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route(route="taskChain", methods=["GET", "POST"])
 def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Why: The validationToken check must happen before anything else,
-    regardless of HTTP method. Graph sends its validation handshake as
-    a POST, not a GET as might be expected. Checking for the token first
-    means both validation and task notifications are handled correctly.
+    Why: A single route handles both sides of the Graph webhook lifecycle:
+
+    GET  — Subscription validation. Graph sends a validationToken query
+           parameter when a subscription is first registered. Monica must
+           echo it back as plain text within 10 seconds or Graph rejects
+           the subscription.
+
+    POST — Task completion notification. Graph posts a JSON payload when
+           a monitored task changes. Monica checks whether the task was
+           completed, looks up the matching chain in task-chains.json,
+           deduplicates, and creates the successor task.
     """
+
+    # ── GET: Webhook validation ───────────────────────────────────────────────
     validation_token = req.params.get("validationToken")
     if validation_token:
-        logging.info("Webhook validation request received - responding with token")
+        logging.info("Webhook validation request received — echoing token")
         return func.HttpResponse(
-            validation_token,
+            body=validation_token,
             status_code=200,
             mimetype="text/plain"
         )
 
-    logging.info("taskChain function triggered")
-    user_id = "cda66539-6f2a-4a27-a5a3-a493061f8711"
-
+    # ── POST: Notification processing ────────────────────────────────────────
     try:
         body = req.get_json()
-        notifications = body.get("value", [])
+    except ValueError:
+        logging.error("Request body could not be parsed as JSON")
+        return func.HttpResponse("Bad request", status_code=400)
 
-        token = get_access_token()
-        chains = get_task_chains(token)
-
-        seen_list_ids = set()
-
-        for notification in notifications:
-            resource = notification.get("resource", "")
-            logging.info(f"Notification received for resource: {resource}")
-
-            list_id_match = re.search(r"lists\('([^']+)'\)", resource)
-            if not list_id_match:
-                logging.error("Could not extract list ID from resource path")
-                continue
-
-            list_id = list_id_match.group(1)
-
-            if list_id in seen_list_ids:
-                logging.info(f"List ID {list_id} already processed in this call, skipping duplicate notification")
-                continue
-            seen_list_ids.add(list_id)
-
-            logging.info(f"Querying list ID: {list_id}")
-
-            completed_tasks = get_completed_tasks(token, user_id, list_id)
-            logging.info(f"Found {len(completed_tasks)} completed tasks in list")
-
-            for task in completed_tasks:
-                completed_title = task.get("title", "")
-                logging.info(f"Checking completed task: {completed_title}")
-
-                for chain in chains:
-                    if chain["trigger_task"] == completed_title:
-                        logging.info(f"Chain match found: {chain['creates_task']}")
-
-                        target_list_id = get_list_id(token, user_id, chain["list"])
-                        if not target_list_id:
-                            logging.error(f"Target list not found: {chain['list']}")
-                            continue
-
-                        if task_exists(token, user_id, target_list_id, chain["creates_task"]):
-                            logging.info(f"Successor task already exists today, skipping: {chain['creates_task']}")
-                            continue
-
-                        due_time = chain.get("due_time")
-                        status, result = create_task(
-                            token,
-                            user_id,
-                            target_list_id,
-                            chain["creates_task"],
-                            chain["category"],
-                            due_time=due_time
-                        )
-                        logging.info(f"Successor task created: {chain['creates_task']} - Status: {status}")
-
+    notifications = body.get("value", [])
+    if not notifications:
+        logging.info("Notification payload contained no items")
         return func.HttpResponse("OK", status_code=200)
 
-    except Exception as e:
-        logging.error(f"taskChain error: {str(e)}")
-        return func.HttpResponse(f"Error: {str(e)}", status_code=500)
+    token  = get_access_token()
+    chains = get_task_chains(token)
+
+    seen_list_ids: set = set()
+
+    for notification in notifications:
+        resource = notification.get("resource", "")
+        parts = resource.split("/")
+
+        list_id_from_resource = None
+        if "lists" in parts:
+            idx = parts.index("lists")
+            if idx + 1 < len(parts):
+                list_id_from_resource = parts[idx + 1]
+
+        if list_id_from_resource in seen_list_ids:
+            logging.info(f"Duplicate notification for list {list_id_from_resource} — skipping")
+            continue
+        if list_id_from_resource:
+            seen_list_ids.add(list_id_from_resource)
+
+        task_id = parts[-1] if parts else None
+        if not task_id:
+            logging.warning("Could not extract task ID from resource — skipping notification")
+            continue
+
+        task_url = f"https://graph.microsoft.com/v1.0/{resource}"
+        task_response = requests.get(
+            task_url,
+            headers={"Authorization": f"Bearer {token}"}
+        )
+        if task_response.status_code != 200:
+            logging.warning(f"Could not fetch task {task_id} ({task_response.status_code}) — skipping")
+            continue
+
+        task = task_response.json()
+
+        if task.get("status") != "completed":
+            logging.info(f"Task '{task.get('title')}' updated but not completed — ignoring")
+            continue
+
+        completed_title = task.get("title", "")
+        logging.info(f"Completed task detected: '{completed_title}'")
+
+        for chain in chains:
+            if chain.get("trigger") != completed_title:
+                continue
+
+            successor_title  = chain.get("successor")
+            target_list_name = chain.get("list")
+            category         = chain.get("category")
+            due_time         = chain.get("due_time")
+
+            target_list_id = get_list_id(target_list_name)
+            if not target_list_id:
+                logging.warning(f"List name '{target_list_name}' not found in LIST_IDS — skipping chain")
+                break
+
+            if task_exists(token, target_list_id, successor_title):
+                logging.info(f"Successor '{successor_title}' already exists today — skipping")
+                break
+
+            created = create_task(token, target_list_id, successor_title, category, due_time)
+            logging.info(
+                f"Successor task created: '{created.get('title')}' "
+                f"in list '{target_list_name}'"
+            )
+            break
+
+    return func.HttpResponse("OK", status_code=200)
