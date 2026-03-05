@@ -4,20 +4,26 @@ email_digest.py — Monica Email Digest Timer Trigger
 Fires every 2 hours (05:00–19:00 UTC daily).
 On Sundays, the 05:00 slot is suppressed in code.
 
-Fetches emails received since the last digest run, groups them by
-Outlook category, and delivers a plain-text summary to the Teams
-Daily Operations channel via the Bot Framework Connector API.
+Fetches emails received since the last digest run and delivers one
+Adaptive Card per email to the Teams Daily Operations channel via the
+Bot Framework Connector API.
 
 WHY this file is self-contained:
   Each Blueprint file owns its own get_access_token() so that one
   broken file cannot take down the rest of the Function App. If the
   Graph token fails here, only this function errors — everything else
   keeps running.
+
+Session 19 change:
+  Plain text formatting replaced with Adaptive Cards. One card per
+  email, ordered newest first. Each card contains sender details,
+  subject, body preview, and four triage action buttons.
 """
 
 import os
 import json
 import logging
+import time
 import requests
 import azure.functions as func
 
@@ -31,22 +37,15 @@ from azure.storage.blob import BlobServiceClient
 bp = func.Blueprint()
 
 # ── Constants ────────────────────────────────────────────────────────────────
-LONDON_TZ   = ZoneInfo("Europe/London")   # handles GMT/BST switch on 29 Mar 2026
-BLOB_CONTAINER = "monica-digest"          # container name in the storage account
-BLOB_NAME      = "last_run.txt"           # stores the ISO timestamp of the last run
+LONDON_TZ      = ZoneInfo("Europe/London")   # handles GMT/BST switch on 29 Mar 2026
+BLOB_CONTAINER = "monica-digest"             # container name in the storage account
+BLOB_NAME      = "last_run.txt"              # stores the ISO timestamp of the last run
 
-# Outlook categories used in the Monica categorisation system
-CATEGORY_ORDER = [
-    "[00] Action Required",
-    "[00] Read Later",
-    "[00] System",
-    "[01] Self",
-    "[02] Work",
-    "[03] Friendship Circles",
-    "[04] Community",
-    "[05] Family",
-    "[99] Archive",
-]
+# WHY 0.3 seconds between cards:
+#   Sending many cards in rapid succession can hit Bot Framework rate limits.
+#   A small delay keeps us well within the per-second limit without
+#   meaningfully slowing delivery — 20 cards still arrive in under 10 seconds.
+CARD_SEND_DELAY = 0.3
 
 
 # ── Timer Trigger ─────────────────────────────────────────────────────────────
@@ -91,27 +90,25 @@ def emailDigest(timer: func.TimerRequest) -> None:
     logging.info(f"emailDigest: fetched {len(emails)} emails")
 
     # ── Step 3: Write the new last-run timestamp ──────────────────────────────
-    # WHY: We write BEFORE formatting so that even if delivery fails the
-    # window advances. We do not want to re-deliver the same batch.
+    # WHY: We write BEFORE delivery so that even if delivery fails the window
+    # advances. We do not want to re-deliver the same batch next run.
     _write_last_run(now_utc)
 
-    # ── Step 4: If no emails, send a brief confirmation and exit ─────────────
+    # ── Step 4: If no emails, send a brief plain-text confirmation and exit ───
     if not emails:
-        _send_to_teams(
-            token,
-            f"📭 No new emails since last digest ({_fmt_time(last_run_utc or now_utc, tz_label)})."
-        )
+        since_label = _fmt_time(last_run_utc or now_utc, tz_label)
+        _send_text_to_teams(f"📭 No new emails since last digest ({since_label}).")
         return
 
-    # ── Step 5: Group emails by Outlook category ──────────────────────────────
-    grouped = _group_by_category(emails)
+    # ── Step 5: Send one Adaptive Card per email, newest first ───────────────
+    # WHY newest first: emails already arrive ordered by receivedDateTime desc
+    # from the Graph query. No re-sorting needed.
+    for email in emails:
+        card = _build_card(email, tz_label)
+        _send_card_to_teams(card)
+        time.sleep(CARD_SEND_DELAY)   # avoid Bot Framework rate limits
 
-    # ── Step 6: Format the digest message ────────────────────────────────────
-    message = _format_digest(grouped, last_run_utc, now_london, tz_label)
-
-    # ── Step 7: Deliver to Teams ──────────────────────────────────────────────
-    _send_to_teams(token, message)
-    logging.info("emailDigest: digest delivered successfully")
+    logging.info(f"emailDigest: {len(emails)} card(s) delivered successfully")
 
 
 # ── Authentication ─────────────────────────────────────────────────────────────
@@ -189,11 +186,16 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     WHY top=100:
       A 2-hour window on a busy inbox might exceed 50 items. 100 is a
       reasonable ceiling; if more arrive we log a warning.
+
+    WHY bodyPreview and id in $select:
+      bodyPreview gives us the first ~255 characters of the email body,
+      which we display in the card. id is the Graph message identifier
+      we embed in each triage button's data payload so the messages
+      function knows which email to act on when a button is pressed.
     """
     headers = {"Authorization": f"Bearer {token}"}
 
     if since:
-        # Format to ISO 8601 without microseconds — Graph requires this form
         since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
         filter_clause = f"receivedDateTime ge {since_str}"
     else:
@@ -206,7 +208,7 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
         "https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711/mailFolders/Inbox/messages"
         f"?$filter={filter_clause}"
         "&$top=100"
-        "&$select=subject,from,receivedDateTime,categories,isRead"
+        "&$select=id,subject,from,receivedDateTime,categories,isRead,bodyPreview"
         "&$orderby=receivedDateTime desc"
     )
 
@@ -270,28 +272,7 @@ def _write_last_run(timestamp: datetime) -> None:
         logging.error(f"emailDigest: failed to write last_run blob — {e}")
 
 
-# ── Formatting helpers ─────────────────────────────────────────────────────────
-def _group_by_category(emails: list[dict]) -> dict[str, list[dict]]:
-    """
-    Group emails by their first Outlook category.
-
-    WHY first category only:
-      An email can technically have multiple categories, but Monica's system
-      assigns exactly one. Taking the first element keeps the logic simple.
-    """
-    grouped: dict[str, list[dict]] = {cat: [] for cat in CATEGORY_ORDER}
-    grouped["Uncategorised"] = []
-
-    for email in emails:
-        cats = email.get("categories", [])
-        key  = cats[0] if cats else "Uncategorised"
-        if key not in grouped:
-            grouped[key] = []
-        grouped[key].append(email)
-
-    return grouped
-
-
+# ── Time formatting helper ─────────────────────────────────────────────────────
 def _fmt_time(dt: datetime, tz_label: str) -> str:
     """
     Format a UTC datetime for display in the London timezone.
@@ -304,88 +285,334 @@ def _fmt_time(dt: datetime, tz_label: str) -> str:
     return local.strftime(f"%H:%M {tz_label} on %a %d %b")
 
 
-def _format_digest(
-    grouped:    dict[str, list[dict]],
-    since:      datetime | None,
-    now_london: datetime,
-    tz_label:   str,
-) -> str:
+# ── Adaptive Card builder ──────────────────────────────────────────────────────
+def _build_card(email: dict, tz_label: str) -> dict:
     """
-    Build the plain-text digest message.
+    Build one Adaptive Card dict for a single email.
 
-    WHY plain text for Session 18:
-      Adaptive Cards require a separate well-tested payload structure.
-      Plain text is delivered and readable immediately, with no render risk.
-      Session 19 will replace this function body with Adaptive Card JSON.
+    WHY one card per email:
+      The design principle is A&E triage — each email is a decision, and
+      the card is the triage interface. A summary card before individual
+      cards would create another inbox and add a step. The individual
+      card IS the triage.
+
+    WHY Container with style=emphasis as the outer wrapper:
+      Teams overrides backgroundColor on cards, so we cannot force a
+      dark background. Instead we use the native emphasis style, which
+      renders as a grey card in both light and dark Teams themes.
+      bleed=True extends the background to the full card edge.
+
+    WHY default-style containers for triage buttons:
+      White/light tiles against the grey card background give natural
+      contrast without any colour overrides. selectAction makes the
+      entire container clickable — the label is centred within it —
+      giving us full-width, equal-sized tappable areas.
+
+    WHY emailId in button data:
+      When a button is pressed, Teams sends an Action.Submit payload to
+      the /api/messages endpoint. The messages function needs the Graph
+      message ID to know which email to move, flag, or delete. We embed
+      it here so no state lookup is required at action time.
+
+    NOTE — sender profile photo:
+      The Graph /users/{email}/photo endpoint returns binary, not a URL,
+      so it cannot be used directly in an Adaptive Card image element.
+      Photo display is deferred to a future session when contact
+      enrichment is added to the people intelligence layer.
+
+    NOTE — View button deep link:
+      A proper per-message Outlook deep link requires URL-encoding the
+      Graph message ID, which is a long opaque string. For Session 19
+      the View button opens the Outlook inbox. Per-message deep links
+      are a future refinement.
     """
-    tz_label_now = "BST" if now_london.utcoffset() == timedelta(hours=1) else "GMT"
-    header_time  = now_london.strftime(f"%H:%M {tz_label_now}")
+    # ── Extract email fields ──────────────────────────────────────────────────
+    sender_name  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
+    sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
+    subject      = (email.get("subject", "") or "(no subject)").strip()
+    body_preview = (email.get("bodyPreview", "") or "").strip()
+    email_id     = email.get("id", "")
 
-    if since:
-        window_str = f"since {_fmt_time(since, tz_label)}"
-    else:
-        window_str = "last 2 hours (first run)"
+    # Truncate preview to ~150 characters — keeps cards a consistent height
+    if len(body_preview) > 150:
+        body_preview = body_preview[:147] + "…"
 
-    lines = [
-        f"📬 Email Digest — {header_time}",
-        f"Window: {window_str}",
-        "",
-    ]
+    # Convert received time to London local time for display
+    received_str = email.get("receivedDateTime", "")
+    try:
+        received_utc    = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
+        received_london = received_utc.astimezone(LONDON_TZ)
+        time_label      = received_london.strftime("%H:%M")
+    except Exception:
+        time_label = ""
 
-    total = sum(len(v) for v in grouped.values())
-    lines.append(f"{total} email(s) received")
-    lines.append("")
-
-    # Categorised emails — iterate in defined order then uncategorised
-    ordered_keys = CATEGORY_ORDER + ["Uncategorised"]
-    for cat in ordered_keys:
-        items = grouped.get(cat, [])
-        if not items:
-            continue
-        lines.append(f"── {cat} ({len(items)}) ──")
-        for email in items[:10]:   # cap per-category to keep message readable
-            sender  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
-            subject = email.get("subject", "(no subject)").strip()
-            # Truncate long subjects so the message stays scannable
-            if len(subject) > 60:
-                subject = subject[:57] + "…"
-            lines.append(f"  • {sender}: {subject}")
-        if len(items) > 10:
-            lines.append(f"  … and {len(items) - 10} more")
-        lines.append("")
-
-    return "\n".join(lines)
+    # ── Build and return the card dict ────────────────────────────────────────
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.5",
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": [
+                    # ── Sender row: name, email address, timestamp ────────────
+                    {
+                        "type": "ColumnSet",
+                        "columns": [
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "spacing": "Small",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": sender_name,
+                                        "weight": "Bolder",
+                                        "wrap": True,
+                                        "spacing": "None"
+                                    },
+                                    {
+                                        "type": "ColumnSet",
+                                        "spacing": "None",
+                                        "columns": [
+                                            {
+                                                "type": "Column",
+                                                "width": "stretch",
+                                                "items": [
+                                                    {
+                                                        "type": "TextBlock",
+                                                        "text": sender_email,
+                                                        "isSubtle": True,
+                                                        "size": "Small",
+                                                        "wrap": True,
+                                                        "spacing": "None"
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                "type": "Column",
+                                                "width": "auto",
+                                                "items": [
+                                                    {
+                                                        "type": "TextBlock",
+                                                        "text": time_label,
+                                                        "isSubtle": True,
+                                                        "size": "Small",
+                                                        "horizontalAlignment": "Right",
+                                                        "spacing": "None"
+                                                    }
+                                                ]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    # ── Subject line ──────────────────────────────────────────
+                    {
+                        "type": "TextBlock",
+                        "text": subject,
+                        "weight": "Bolder",
+                        "size": "Medium",
+                        "wrap": True,
+                        "spacing": "Small"
+                    },
+                    # ── Body preview ──────────────────────────────────────────
+                    {
+                        "type": "TextBlock",
+                        "text": body_preview,
+                        "isSubtle": True,
+                        "wrap": True,
+                        "maxLines": 3,
+                        "spacing": "Small"
+                    },
+                    # ── Triage buttons — 2×2 grid ─────────────────────────────
+                    {
+                        "type": "ColumnSet",
+                        "spacing": "Medium",
+                        "columns": [
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "spacing": "Small",
+                                "items": [
+                                    {
+                                        "type": "Container",
+                                        "style": "default",
+                                        "spacing": "Small",
+                                        "selectAction": {
+                                            "type": "Action.Submit",
+                                            "data": {
+                                                "triageAction": "action",
+                                                "emailId": email_id
+                                            }
+                                        },
+                                        "items": [
+                                            {
+                                                "type": "TextBlock",
+                                                "text": "Action",
+                                                "horizontalAlignment": "Center",
+                                                "weight": "Bolder",
+                                                "spacing": "Small"
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "type": "Container",
+                                        "style": "default",
+                                        "spacing": "Small",
+                                        "selectAction": {
+                                            "type": "Action.Submit",
+                                            "data": {
+                                                "triageAction": "waiting",
+                                                "emailId": email_id
+                                            }
+                                        },
+                                        "items": [
+                                            {
+                                                "type": "TextBlock",
+                                                "text": "Waiting For",
+                                                "horizontalAlignment": "Center",
+                                                "weight": "Bolder",
+                                                "spacing": "Small"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "spacing": "Small",
+                                "items": [
+                                    {
+                                        "type": "Container",
+                                        "style": "default",
+                                        "spacing": "Small",
+                                        "selectAction": {
+                                            "type": "Action.OpenUrl",
+                                            "url": "https://outlook.office365.com/mail/inbox"
+                                        },
+                                        "items": [
+                                            {
+                                                "type": "TextBlock",
+                                                "text": "View",
+                                                "horizontalAlignment": "Center",
+                                                "weight": "Bolder",
+                                                "spacing": "Small"
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "type": "Container",
+                                        "style": "default",
+                                        "spacing": "Small",
+                                        "selectAction": {
+                                            "type": "Action.Submit",
+                                            "data": {
+                                                "triageAction": "delete",
+                                                "emailId": email_id
+                                            }
+                                        },
+                                        "items": [
+                                            {
+                                                "type": "TextBlock",
+                                                "text": "Delete",
+                                                "horizontalAlignment": "Center",
+                                                "weight": "Bolder",
+                                                "spacing": "Small"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
 
 
 # ── Teams delivery ─────────────────────────────────────────────────────────────
-def _send_to_teams(graph_token: str, text: str) -> None:
+def _get_delivery_config() -> tuple[str, str, str, str]:
     """
-    Post a plain-text message to the Teams Daily Operations channel
+    Retrieve the shared Bot Framework delivery config.
+
+    WHY extracted as a helper:
+      Both _send_text_to_teams and _send_card_to_teams need the same four
+      values. Extracting them avoids repetition and keeps each send
+      function focused on its payload format only.
+
+    Returns: (bot_token, service_url, conversation_id, bot_app_id)
+    """
+    bot_token    = _get_bot_token()
+    service_url  = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
+    conversation = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
+    bot_app_id   = os.environ["BOT_APP_ID"]
+    return bot_token, service_url, conversation, bot_app_id
+
+
+def _send_text_to_teams(text: str) -> None:
+    """
+    Post a plain-text message to the Teams Daily Operations channel.
+
+    WHY plain text for the no-email case:
+      A single short status message does not need a card. Plain text is
+      lighter and renders immediately in all Teams clients.
+    """
+    bot_token, service_url, conversation, bot_app_id = _get_delivery_config()
+    url = f"{service_url}/v3/conversations/{conversation}/activities"
+
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {bot_token}",
+            "Content-Type":  "application/json",
+        },
+        json={
+            "type": "message",
+            "from": {"id": bot_app_id},
+            "text": text,
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    logging.info(f"emailDigest: plain text delivered — status {resp.status_code}")
+
+
+def _send_card_to_teams(card: dict) -> None:
+    """
+    Post a single Adaptive Card to the Teams Daily Operations channel
     via the Bot Framework Connector API.
+
+    WHY attachments with contentType adaptive card:
+      The Bot Framework Connector expects Adaptive Cards wrapped in an
+      attachments array with the contentType set to the adaptive card
+      MIME type. Without this wrapper Teams renders the card JSON as
+      raw text rather than a rendered card.
 
     WHY Bot Framework Connector (not Graph API):
       The digest is delivered as a bot message — it appears as Monica
       speaking in the channel. Graph's /chats endpoint works differently
       and requires additional permissions. The Bot Framework Connector
       is the correct path for bot-originated messages.
-
-    WHY TEAMS_DAILY_OPERATIONS_ID and TEAMS_SERVICE_URL from env:
-      Both values were captured from the live bot interaction and stored
-      in Key Vault during Session 12. Reading them from environment
-      variables (Key Vault references) means no values are hardcoded and
-      the delivery target can be changed in Key Vault without a redeploy.
     """
-    bot_token    = _get_bot_token()
-    service_url  = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
-    conversation = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
-    bot_app_id   = os.environ["BOT_APP_ID"]
-
+    bot_token, service_url, conversation, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{conversation}/activities"
 
     payload = {
         "type": "message",
         "from": {"id": bot_app_id},
-        "text": text,
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card,
+            }
+        ],
     }
 
     resp = requests.post(
@@ -398,4 +625,4 @@ def _send_to_teams(graph_token: str, text: str) -> None:
         timeout=15,
     )
     resp.raise_for_status()
-    logging.info(f"emailDigest: Teams delivery status {resp.status_code}")
+    logging.info(f"emailDigest: card delivered — status {resp.status_code}")
