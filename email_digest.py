@@ -83,7 +83,10 @@ def emailDigest(timer: func.TimerRequest) -> None:
     logging.info(f"emailDigest: last run was {last_run_utc.isoformat() if last_run_utc else 'never'}")
 
     # ── Step 2: Fetch emails from Microsoft Graph ─────────────────────────────
-    token  = get_access_token()
+    token = get_access_token()
+    if not token:
+        logging.error("emailDigest: no access token — aborting")
+        return
     emails = _fetch_emails(token, last_run_utc)
     logging.info(f"emailDigest: fetched {len(emails)} emails")
 
@@ -112,24 +115,37 @@ def emailDigest(timer: func.TimerRequest) -> None:
 
 
 # ── Authentication ─────────────────────────────────────────────────────────────
-def get_access_token() -> str:
+def get_access_token() -> str | None:
     """
     Obtain a Microsoft Graph access token using the Function App's
     system-assigned Managed Identity.
 
-    WHY Managed Identity:
-      No client secret is stored in code or environment variables.
-      Azure issues a short-lived token automatically. The Managed Identity
-      must have Mail.Read and the Graph API scopes granted in Entra ID.
+    WHY IDENTITY_ENDPOINT and IDENTITY_HEADER:
+      Azure Functions provides these two environment variables automatically
+      at runtime. They point to a local token broker that the Functions host
+      manages. This is the correct pattern for Azure Functions — the
+      169.254.169.254 metadata address used by VMs does not work here and
+      will time out. The task files (task_morning.py etc.) use this same
+      pattern and are confirmed working.
     """
-    identity_url = (
-        "http://169.254.169.254/metadata/identity/oauth2/token"
-        "?api-version=2019-08-01"
-        "&resource=https://graph.microsoft.com"
-    )
-    resp = requests.get(identity_url, headers={"Metadata": "true"}, timeout=10)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
+    identity_endpoint = os.environ.get("IDENTITY_ENDPOINT")
+    identity_header   = os.environ.get("IDENTITY_HEADER")
+
+    if not identity_endpoint or not identity_header:
+        logging.error("emailDigest: Managed Identity environment variables not set.")
+        return None
+
+    try:
+        response = requests.get(
+            f"{identity_endpoint}?api-version=2019-08-01&resource=https://graph.microsoft.com",
+            headers={"X-IDENTITY-HEADER": identity_header},
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get("access_token")
+    except Exception as e:
+        logging.error(f"emailDigest: token acquisition failed: {e}")
+        return None
 
 
 def _get_bot_token() -> str:
@@ -142,9 +158,9 @@ def _get_bot_token() -> str:
       a different OAuth endpoint and audience to authorise message delivery
       to Teams. They are completely separate credential flows.
     """
-    bot_app_id     = os.environ["BOT_APP_ID"]
-    bot_secret     = os.environ["BOT_CLIENT_SECRET"]
-    tenant_id      = os.environ["TENANT_ID"]
+    bot_app_id = os.environ["BOT_APP_ID"]
+    bot_secret = os.environ["BOT_CLIENT_SECRET"]
+    tenant_id  = os.environ["TENANT_ID"]
 
     resp = requests.post(
         f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
