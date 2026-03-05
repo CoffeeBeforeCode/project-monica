@@ -1,39 +1,94 @@
-# function_app.py
-# Why: Minimal entry point. Each function lives in its own file as a Blueprint.
-# Registering them here means function_app.py never contains business logic —
-# it is only a registry. A broken task file cannot take down other functions.
+"""
+function_app.py — Monica Function App entry point
+
+WHY this file exists:
+  The Azure Functions Python v2 programming model requires a single entry
+  point that imports and registers all Blueprint objects. This file is
+  intentionally minimal — it contains only the ping health-check and the
+  blueprint registrations. All business logic lives in the individual
+  Blueprint files.
+
+  Keeping this file small means that a syntax error in any Blueprint file
+  crashes only that Blueprint. If this file itself crashes, all functions
+  go down — so it must stay simple and free of logic.
+
+Current function inventory (13 timer triggers + 3 HTTP triggers = 16 total):
+
+  File                  Function                    Type
+  ─────────────────────────────────────────────────────────────────────────
+  function_app.py       ping                        HTTP Trigger
+  task_chain.py         taskChain                   HTTP Trigger
+  messages.py           messages                    HTTP Trigger
+  email_digest.py       emailDigest                 Timer — every 2 hours
+  webhook_renewal.py    renewWebhookSubscriptions   Timer — daily 07:00 UTC
+  task_morning.py       createMorningTasks          Timer — daily 05:00 UTC
+  task_evening.py       createEveningTasks          Timer — daily 17:00 UTC
+  task_monday.py        createMondayTasks           Timer — Monday 05:00 UTC
+  task_tuesday.py       createTuesdayTasks          Timer — Tuesday 05:00 UTC
+  task_wednesday.py     createWednesdayTasks        Timer — Wednesday 05:00 UTC
+  task_thursday.py      createThursdayTasks         Timer — Thursday 05:00 UTC
+  task_friday.py        createFridayTasks           Timer — Friday 05:00 UTC
+  task_sunday.py        createSundayTasks           Timer — Sunday 17:00 UTC
+  task_monthly.py       createMonthlyTasks          Timer — 1st of month 05:00 UTC
+  task_keepalive.py     keepAlive                   Timer — every 4 minutes
+"""
 
 import azure.functions as func
 
-from task_chain      import bp as bp_task_chain
-from webhook_renewal import bp as bp_renewal
-from task_morning    import bp as bp_morning
-from task_evening    import bp as bp_evening
-from task_monday     import bp as bp_monday
-from task_tuesday    import bp as bp_tuesday
-from task_wednesday  import bp as bp_wednesday
-from task_thursday   import bp as bp_thursday
-from task_friday     import bp as bp_friday
-from task_sunday     import bp as bp_sunday
-from task_monthly    import bp as bp_monthly
-from task_keepalive  import bp as bp_keepalive
+# ── Blueprint imports ─────────────────────────────────────────────────────────
+# WHY import as aliases (bp_xxx):
+#   Every Blueprint file exports a variable named `bp`. If we imported them
+#   all as `bp`, each import would overwrite the previous. Aliasing makes
+#   each one distinct and makes the registration list below self-documenting.
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+from task_chain       import bp as bp_task_chain
+from messages         import bp as bp_messages
+from email_digest     import bp as bp_email_digest
+from webhook_renewal  import bp as bp_renewal
+from task_morning     import bp as bp_morning
+from task_evening     import bp as bp_evening
+from task_monday      import bp as bp_monday
+from task_tuesday     import bp as bp_tuesday
+from task_wednesday   import bp as bp_wednesday
+from task_thursday    import bp as bp_thursday
+from task_friday      import bp as bp_friday
+from task_sunday      import bp as bp_sunday
+from task_monthly     import bp as bp_monthly
+from task_keepalive   import bp as bp_keepalive
 
-app.register_functions(bp_task_chain)
-app.register_functions(bp_renewal)
-app.register_functions(bp_morning)
-app.register_functions(bp_evening)
-app.register_functions(bp_monday)
-app.register_functions(bp_tuesday)
-app.register_functions(bp_wednesday)
-app.register_functions(bp_thursday)
-app.register_functions(bp_friday)
-app.register_functions(bp_sunday)
-app.register_functions(bp_monthly)
-app.register_functions(bp_keepalive)
+# ── App initialisation ────────────────────────────────────────────────────────
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+# ── Blueprint registration ────────────────────────────────────────────────────
+# WHY register_blueprint:
+#   This is how the v2 model discovers functions defined in other files.
+#   The runtime calls into each registered Blueprint and finds the decorated
+#   functions inside it. Without registration, a Blueprint file is ignored.
+
+app.register_blueprint(bp_task_chain)
+app.register_blueprint(bp_messages)
+app.register_blueprint(bp_email_digest)
+app.register_blueprint(bp_renewal)
+app.register_blueprint(bp_morning)
+app.register_blueprint(bp_evening)
+app.register_blueprint(bp_monday)
+app.register_blueprint(bp_tuesday)
+app.register_blueprint(bp_wednesday)
+app.register_blueprint(bp_thursday)
+app.register_blueprint(bp_friday)
+app.register_blueprint(bp_sunday)
+app.register_blueprint(bp_monthly)
+app.register_blueprint(bp_keepalive)
 
 
-@app.route(route="ping", auth_level=func.AuthLevel.ANONYMOUS)
+# ── Ping health-check ─────────────────────────────────────────────────────────
+@app.route(route="ping", methods=["GET"])
 def ping(req: func.HttpRequest) -> func.HttpResponse:
-    return func.HttpResponse("Monica is online.", status_code=200)
+    """
+    WHY ping lives here and not in its own file:
+      It is a one-liner with no dependencies. Moving it to a Blueprint file
+      would add a file with no benefit. Ping's only job is to confirm the
+      Function App is alive — it should be the last thing standing if
+      everything else fails, so keeping it in the entry point is correct.
+    """
+    return func.HttpResponse("Monica is alive.", status_code=200)
