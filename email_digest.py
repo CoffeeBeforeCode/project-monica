@@ -203,7 +203,7 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
         filter_clause = f"receivedDateTime ge {since_str}"
 
     url = (
-        "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
+        "https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711/mailFolders/Inbox/messages"
         f"?$filter={filter_clause}"
         "&$top=100"
         "&$select=subject,from,receivedDateTime,categories,isRead"
