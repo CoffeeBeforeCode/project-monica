@@ -1208,14 +1208,13 @@ def _create_channel_conversation(
     """
     url  = f"{service_url}/v3/conversations"
     body = {
-        "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
-        "isGroup": True,
-        "tenantId": tenant_id,
-        "channelData": {
-            "channel": {"id": channel_id},
-            "tenant": {"id": tenant_id},
-        },
-    }
+    "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
+    "isGroup": True,
+    "tenantId": tenant_id,
+    "channelData": {
+        "channel": {"id": channel_id},
+    },
+}
     resp = requests.post(
         url,
         headers={
