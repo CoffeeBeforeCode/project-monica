@@ -22,6 +22,13 @@ Session 20 additions:
   - Agenda card (today's calendar events from Graph) on first and second
     daily slot
 
+Session 21 fix:
+  - _create_channel_conversation added to resolve 403 Forbidden error.
+    The Bot Framework Connector does not accept a raw Teams channel thread
+    ID as a conversation target. A conversation must first be created via
+    POST /v3/conversations, and the returned ID used for posting. The bot
+    ID must carry the '28:' prefix required by the Bot Framework.
+
 Slot logic:
   First slot  (weather + agenda + digest):
     Mon–Sat: 05:00 UTC
@@ -1143,7 +1150,14 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
 
 # ── Teams delivery ─────────────────────────────────────────────────────────────
 def _get_delivery_config() -> tuple[str, str, str, str, str]:
-    """Shared Bot Framework delivery config for both send functions."""
+    """
+    Shared Bot Framework delivery config for both send functions.
+
+    WHY five values returned (previously four):
+      The tenant ID is now required to create a channel conversation via
+      the Bot Framework Connector. It is read from the TENANT_ID app
+      setting, which is already present in the Function App.
+    """
     bot_token   = _get_bot_token()
     service_url = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
     channel_id  = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
@@ -1153,40 +1167,42 @@ def _get_delivery_config() -> tuple[str, str, str, str, str]:
 
 
 def _create_channel_conversation(
-    bot_token: str,
+    bot_token:   str,
     service_url: str,
-    channel_id: str,
-    bot_app_id: str,
-    tenant_id: str,
+    channel_id:  str,
+    bot_app_id:  str,
+    tenant_id:   str,
 ) -> str:
     """
-    Create a Bot Framework conversation in a Teams channel.
+    Create a Bot Framework conversation in a Teams channel and return
+    the conversation ID to post activities into.
 
     WHY this step is required:
-      The Bot Framework Connector does not allow posting directly to a
-      Teams channel thread ID. You must first call POST /v3/conversations,
-      passing the channel ID in channelData. The API returns a fresh
-      conversation ID that can then receive activities. Skipping this
-      step results in a 403 Forbidden error — which is exactly what
-      we saw when posting the channel ID directly.
+      The Bot Framework Connector rejects activities sent directly to a
+      Teams channel thread ID (19:...@thread.tacv2) with 403 Forbidden.
+      You must first POST to /v3/conversations to register a new
+      conversation, passing the channel ID in channelData. The API
+      returns a conversation ID that accepts subsequent activities.
 
-    WHY a new conversation is created for each card:
-      Each digest run starts a new thread in the channel, keeping each
-      digest visually separate and easy to scan. A future refinement
-      could reuse one conversation ID per digest run, but correctness
-      first.
+    WHY the bot ID uses the '28:' prefix:
+      The Bot Framework identifies bots with a '28:' namespace prefix.
+      The BOT_APP_ID environment variable stores the raw Azure AD app ID
+      (a GUID). Without the prefix the conversation creation call returns
+      400 Bad Request because the bot identity is not recognised.
+
+    WHY no 'activity' field in the body:
+      The activity field is not valid on the conversation creation
+      endpoint and causes a 400 error. The initial message, if any,
+      is sent as a separate POST to the returned conversation ID.
     """
     url  = f"{service_url}/v3/conversations"
     body = {
-        "bot": {"id": bot_app_id, "name": "Monica"},
+        "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
         "isGroup": True,
+        "tenantId": tenant_id,
         "channelData": {
             "channel": {"id": channel_id},
             "tenant": {"id": tenant_id},
-        },
-        "activity": {
-            "type": "message",
-            "text": "",
         },
     }
     resp = requests.post(
@@ -1213,7 +1229,7 @@ def _send_text_to_teams(text: str) -> None:
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
-        json={"type": "message", "from": {"id": bot_app_id}, "text": text},
+        json={"type": "message", "from": {"id": f"28:{bot_app_id}"}, "text": text},
         timeout=15,
     )
     resp.raise_for_status()
@@ -1231,10 +1247,10 @@ def _send_card_to_teams(card: dict) -> None:
       Cards appear as bot messages. The Connector is the correct path
       for bot-originated messages and requires no additional permissions.
 
-    WHY _create_channel_conversation is called per card:
-      Each card gets its own thread for now. This is correct and simple.
-      A future session can refactor to share one conversation ID across
-      all cards in a single digest run.
+    WHY a new conversation is created per card:
+      Each card gets its own thread for now — clean and simple. A future
+      session can refactor to share one conversation ID per digest run,
+      so all cards in a run appear as replies in the same thread.
     """
     bot_token, service_url, channel_id, bot_app_id, tenant_id = _get_delivery_config()
     conversation_id = _create_channel_conversation(
@@ -1244,7 +1260,7 @@ def _send_card_to_teams(card: dict) -> None:
 
     payload = {
         "type": "message",
-        "from": {"id": bot_app_id},
+        "from": {"id": f"28:{bot_app_id}"},
         "attachments": [
             {
                 "contentType": "application/vnd.microsoft.card.adaptive",
