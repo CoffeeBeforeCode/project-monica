@@ -33,6 +33,8 @@ Session 22 fix:
   - _create_channel_conversation now logs the full Bot Framework response
     body before raising on error, so the exact rejection reason is visible
     in Application Insights traces rather than only the HTTP status code.
+  - Conversation creation body corrected: tenantId removed from root level;
+    tenant placed inside channelData as required by the Bot Framework schema.
 
 Slot logic:
   First slot  (weather + agenda + digest):
@@ -1200,6 +1202,12 @@ def _create_channel_conversation(
       endpoint and causes a 400 error. The initial message, if any,
       is sent as a separate POST to the returned conversation ID.
 
+    WHY tenant lives inside channelData, not at root:
+      The Bot Framework ConversationParameters schema for Teams channel
+      conversations expects tenant identification inside channelData as
+      {"tenant": {"id": ...}}. A root-level tenantId field is not part
+      of the schema for this endpoint and causes a BadSyntax 400 error.
+
     WHY log resp.text before raise_for_status:
       raise_for_status() discards the response body when it throws.
       Logging resp.text first preserves the Bot Framework's exact error
@@ -1208,13 +1216,13 @@ def _create_channel_conversation(
     """
     url  = f"{service_url}/v3/conversations"
     body = {
-    "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
-    "isGroup": True,
-    "tenantId": tenant_id,
-    "channelData": {
-        "channel": {"id": channel_id},
-    },
-}
+        "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
+        "isGroup": True,
+        "channelData": {
+            "channel": {"id": channel_id},
+            "tenant": {"id": tenant_id},
+        },
+    }
     resp = requests.post(
         url,
         headers={
