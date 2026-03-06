@@ -1142,19 +1142,73 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
 
 
 # ── Teams delivery ─────────────────────────────────────────────────────────────
-def _get_delivery_config() -> tuple[str, str, str, str]:
+def _get_delivery_config() -> tuple[str, str, str, str, str]:
     """Shared Bot Framework delivery config for both send functions."""
-    bot_token    = _get_bot_token()
-    service_url  = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
-    conversation = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
-    bot_app_id   = os.environ["BOT_APP_ID"]
-    return bot_token, service_url, conversation, bot_app_id
+    bot_token   = _get_bot_token()
+    service_url = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
+    channel_id  = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
+    bot_app_id  = os.environ["BOT_APP_ID"]
+    tenant_id   = os.environ["TENANT_ID"]
+    return bot_token, service_url, channel_id, bot_app_id, tenant_id
+
+
+def _create_channel_conversation(
+    bot_token: str,
+    service_url: str,
+    channel_id: str,
+    bot_app_id: str,
+    tenant_id: str,
+) -> str:
+    """
+    Create a Bot Framework conversation in a Teams channel.
+
+    WHY this step is required:
+      The Bot Framework Connector does not allow posting directly to a
+      Teams channel thread ID. You must first call POST /v3/conversations,
+      passing the channel ID in channelData. The API returns a fresh
+      conversation ID that can then receive activities. Skipping this
+      step results in a 403 Forbidden error — which is exactly what
+      we saw when posting the channel ID directly.
+
+    WHY a new conversation is created for each card:
+      Each digest run starts a new thread in the channel, keeping each
+      digest visually separate and easy to scan. A future refinement
+      could reuse one conversation ID per digest run, but correctness
+      first.
+    """
+    url  = f"{service_url}/v3/conversations"
+    body = {
+        "bot": {"id": bot_app_id, "name": "Monica"},
+        "isGroup": True,
+        "channelData": {
+            "channel": {"id": channel_id},
+            "tenant": {"id": tenant_id},
+        },
+        "activity": {
+            "type": "message",
+            "text": "",
+        },
+    }
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {bot_token}",
+            "Content-Type":  "application/json",
+        },
+        json=body,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
 
 
 def _send_text_to_teams(text: str) -> None:
     """Plain-text message for the no-email case — lighter than a card."""
-    bot_token, service_url, conversation, bot_app_id = _get_delivery_config()
-    url = f"{service_url}/v3/conversations/{conversation}/activities"
+    bot_token, service_url, channel_id, bot_app_id, tenant_id = _get_delivery_config()
+    conversation_id = _create_channel_conversation(
+        bot_token, service_url, channel_id, bot_app_id, tenant_id
+    )
+    url = f"{service_url}/v3/conversations/{conversation_id}/activities"
 
     resp = requests.post(
         url,
@@ -1176,9 +1230,17 @@ def _send_card_to_teams(card: dict) -> None:
     WHY Bot Framework Connector (not Graph API):
       Cards appear as bot messages. The Connector is the correct path
       for bot-originated messages and requires no additional permissions.
+
+    WHY _create_channel_conversation is called per card:
+      Each card gets its own thread for now. This is correct and simple.
+      A future session can refactor to share one conversation ID across
+      all cards in a single digest run.
     """
-    bot_token, service_url, conversation, bot_app_id = _get_delivery_config()
-    url = f"{service_url}/v3/conversations/{conversation}/activities"
+    bot_token, service_url, channel_id, bot_app_id, tenant_id = _get_delivery_config()
+    conversation_id = _create_channel_conversation(
+        bot_token, service_url, channel_id, bot_app_id, tenant_id
+    )
+    url = f"{service_url}/v3/conversations/{conversation_id}/activities"
 
     payload = {
         "type": "message",
