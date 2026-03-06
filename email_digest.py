@@ -1214,17 +1214,15 @@ def _create_channel_conversation(
       message in Application Insights, which is the only way to know
       what the API is rejecting.
     """
-    url     = f"{service_url}/v3/conversations"
-team_id = os.environ["TEAMS_TEAM_ID"]
-body    = {
-    "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
-    "isGroup": True,
-    "channelData": {
-        "channel": {"id": channel_id},
-        "team":    {"id": team_id},
-        "tenant":  {"id": tenant_id},
-    },
-}
+    url  = f"{service_url}/v3/conversations"
+    body = {
+        "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
+        "isGroup": True,
+        "channelData": {
+            "channel": {"id": channel_id},
+            "tenant": {"id": tenant_id},
+        },
+    }
     resp = requests.post(
         url,
         headers={
