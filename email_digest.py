@@ -29,6 +29,11 @@ Session 21 fix:
     POST /v3/conversations, and the returned ID used for posting. The bot
     ID must carry the '28:' prefix required by the Bot Framework.
 
+Session 22 fix:
+  - _create_channel_conversation now logs the full Bot Framework response
+    body before raising on error, so the exact rejection reason is visible
+    in Application Insights traces rather than only the HTTP status code.
+
 Slot logic:
   First slot  (weather + agenda + digest):
     Mon–Sat: 05:00 UTC
@@ -1194,6 +1199,12 @@ def _create_channel_conversation(
       The activity field is not valid on the conversation creation
       endpoint and causes a 400 error. The initial message, if any,
       is sent as a separate POST to the returned conversation ID.
+
+    WHY log resp.text before raise_for_status:
+      raise_for_status() discards the response body when it throws.
+      Logging resp.text first preserves the Bot Framework's exact error
+      message in Application Insights, which is the only way to know
+      what the API is rejecting.
     """
     url  = f"{service_url}/v3/conversations"
     body = {
@@ -1214,6 +1225,11 @@ def _create_channel_conversation(
         json=body,
         timeout=15,
     )
+    if not resp.ok:
+        logging.error(
+            f"emailDigest: conversation creation failed — "
+            f"{resp.status_code} — {resp.text}"
+        )
     resp.raise_for_status()
     return resp.json()["id"]
 
