@@ -319,10 +319,10 @@ def _get_folder_id(token: str, folder_name: str) -> str:
       The cost is one extra API call per triage action — acceptable given
       the low frequency of button presses.
 
-    WHY mailFolders/search rather than childFolders:
-      The Action and Waiting For folders sit at the top level of the
-      mailbox (not nested inside Inbox). mailFolders returns all
-      top-level folders; Inbox/childFolders would miss them.
+    WHY top-level mailFolders:
+      Action and Waiting For are top-level folders in the mailbox (same
+      level as Inbox). Querying mailFolders returns all top-level folders
+      and the $filter narrows it to the one we need.
     """
     url  = f"{GRAPH_BASE}/mailFolders?$filter=displayName eq '{folder_name}'"
     resp = requests.get(
