@@ -33,8 +33,9 @@ Session 22 fix:
   - _create_channel_conversation now logs the full Bot Framework response
     body before raising on error, so the exact rejection reason is visible
     in Application Insights traces rather than only the HTTP status code.
-  - Conversation creation body corrected: tenantId removed from root level;
-    tenant placed inside channelData as required by the Bot Framework schema.
+  - Conversation creation body corrected: root-level tenantId removed;
+    channelData now contains channel, team, and tenant as required by
+    the Bot Framework ConversationParameters schema for Teams channels.
 
 Slot logic:
   First slot  (weather + agenda + digest):
@@ -1202,11 +1203,18 @@ def _create_channel_conversation(
       endpoint and causes a 400 error. The initial message, if any,
       is sent as a separate POST to the returned conversation ID.
 
-    WHY tenant lives inside channelData, not at root:
-      The Bot Framework ConversationParameters schema for Teams channel
-      conversations expects tenant identification inside channelData as
-      {"tenant": {"id": ...}}. A root-level tenantId field is not part
-      of the schema for this endpoint and causes a BadSyntax 400 error.
+    WHY channelData requires channel, team, and tenant:
+      The Bot Framework needs all three to locate the destination.
+      channel identifies the specific thread. team identifies which
+      Team that channel belongs to — without it the Bot Framework cannot
+      resolve the channel ID unambiguously. tenant identifies the M365
+      organisation. All three are required for channel conversations.
+
+    WHY TEAMS_TEAM_ID is read inside this function rather than passed in:
+      The team ID is only needed here — not by any other delivery
+      function. Reading it locally keeps the call signatures clean and
+      avoids threading a value through _get_delivery_config that nothing
+      else uses.
 
     WHY log resp.text before raise_for_status:
       raise_for_status() discards the response body when it throws.
@@ -1214,13 +1222,15 @@ def _create_channel_conversation(
       message in Application Insights, which is the only way to know
       what the API is rejecting.
     """
-    url  = f"{service_url}/v3/conversations"
-    body = {
+    url     = f"{service_url}/v3/conversations"
+    team_id = os.environ["TEAMS_TEAM_ID"]
+    body    = {
         "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
         "isGroup": True,
         "channelData": {
             "channel": {"id": channel_id},
-            "tenant": {"id": tenant_id},
+            "team":    {"id": team_id},
+            "tenant":  {"id": tenant_id},
         },
     }
     resp = requests.post(
