@@ -24,6 +24,10 @@ Session 20 change:
     1. Internal M365 user photo (Graph /users/{email}/photo/$value)
     2. Saved contact photo (Graph /me/contacts filtered by email)
     3. Envelope icon fallback (embedded SVG, no external dependency)
+
+  Digest header card added. Sent before the email cards. Contains
+  a time-aware greeting, the digest window, and the email count.
+  Uses the same emphasis container style as the email cards.
 """
 
 import os
@@ -122,15 +126,25 @@ def emailDigest(timer: func.TimerRequest) -> None:
         _send_text_to_teams(f"📭 No new emails since last digest ({since_label}).")
         return
 
-    # ── Step 5: Send one Adaptive Card per email, newest first ───────────────
+    # ── Step 5: Send the header card ─────────────────────────────────────────
+    # WHY header card before email cards:
+    #   The header gives immediate context — how many emails are coming and
+    #   what window they cover — before the triage cards begin. It also
+    #   provides a natural visual separator between digest runs when
+    #   scrolling back through the channel history.
+    header_card = _build_header_card(now_london, tz_label, last_run_utc, len(emails))
+    _send_card_to_teams(header_card)
+    time.sleep(CARD_SEND_DELAY)
+
+    # ── Step 6: Send one Adaptive Card per email, newest first ───────────────
     # WHY newest first: emails already arrive ordered by receivedDateTime desc
     # from the Graph query. No re-sorting needed.
     for email in emails:
         card = _build_card(email, tz_label, token)
         _send_card_to_teams(card)
-        time.sleep(CARD_SEND_DELAY)   # avoid Bot Framework rate limits
+        time.sleep(CARD_SEND_DELAY)
 
-    logging.info(f"emailDigest: {len(emails)} card(s) delivered successfully")
+    logging.info(f"emailDigest: header + {len(emails)} card(s) delivered successfully")
 
 
 # ── Authentication ─────────────────────────────────────────────────────────────
@@ -221,7 +235,6 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
         since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
         filter_clause = f"receivedDateTime ge {since_str}"
     else:
-        # First ever run: fall back to the last 2 hours
         two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=2)
         since_str = two_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
         filter_clause = f"receivedDateTime ge {since_str}"
@@ -265,12 +278,8 @@ def _get_sender_photo(token: str, sender_email: str) -> str:
 
     Resolution order:
       1. Internal M365 user — Graph /users/{email}/photo/$value
-         Works for anyone in the same tenant (colleagues, licensed users).
-      2. Saved contact — Graph /me/contacts filtered by email address,
-         then fetch that contact's stored photo.
-         Works for external senders Phillip has saved with a photo.
-      3. Envelope icon fallback — the ENVELOPE_ICON constant defined above.
-         Used when neither lookup finds a photo. Always succeeds.
+      2. Saved contact — Graph /me/contacts filtered by email, then photo
+      3. Envelope icon fallback — always succeeds
     """
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -329,12 +338,10 @@ def _get_blob_client():
       This connection string is already required by the Azure Functions
       runtime for its own state management. We reuse it to store the
       last-run timestamp rather than provisioning a separate storage
-      account. Azure resolves the Key Vault reference at runtime so
-      os.environ['AzureWebJobsStorage'] returns the actual connection string.
+      account.
     """
     conn_str = os.environ["AzureWebJobsStorage"]
     service  = BlobServiceClient.from_connection_string(conn_str)
-    # Ensure the container exists (idempotent)
     try:
         service.create_container(BLOB_CONTAINER)
     except Exception:
@@ -346,17 +353,13 @@ def _read_last_run() -> datetime | None:
     """
     Read the ISO timestamp written by the previous digest run.
     Returns None if this is the first ever run.
-
-    WHY store as plain ISO text:
-      Simple, human-readable, and trivially editable from the Azure Portal
-      Storage Explorer if we ever need to reset the window manually.
     """
     try:
         client = _get_blob_client()
         data   = client.download_blob().readall().decode("utf-8").strip()
         return datetime.fromisoformat(data).replace(tzinfo=timezone.utc)
     except Exception:
-        return None  # blob not found — first run
+        return None
 
 
 def _write_last_run(timestamp: datetime) -> None:
@@ -371,87 +374,81 @@ def _write_last_run(timestamp: datetime) -> None:
         logging.error(f"emailDigest: failed to write last_run blob — {e}")
 
 
-# ── Time formatting helper ─────────────────────────────────────────────────────
+# ── Time formatting helpers ────────────────────────────────────────────────────
 def _fmt_time(dt: datetime, tz_label: str) -> str:
-    """
-    Format a UTC datetime for display in the London timezone.
-
-    WHY convert to London time:
-      The digest is for Phillip's benefit. Showing UTC timestamps requires
-      mental arithmetic; showing the London local time is immediately useful.
-    """
+    """Format a UTC datetime for display in the London timezone."""
     local = dt.astimezone(LONDON_TZ)
     return local.strftime(f"%H:%M {tz_label} on %a %d %b")
 
 
-# ── Adaptive Card builder ──────────────────────────────────────────────────────
-def _build_card(email: dict, tz_label: str, token: str) -> dict:
+def _greeting(now_london: datetime) -> str:
     """
-    Build one Adaptive Card dict for a single email.
+    Return a time-appropriate greeting for the header card.
 
-    WHY one card per email:
-      The design principle is A&E triage — each email is a decision, and
-      the card is the triage interface. A summary card before individual
-      cards would create another inbox and add a step. The individual
-      card IS the triage.
-
-    WHY Container with style=emphasis as the outer wrapper:
-      Teams overrides backgroundColor on cards, so we cannot force a
-      dark background. Instead we use the native emphasis style, which
-      renders as a grey card in both light and dark Teams themes.
-      bleed=True extends the background to the full card edge.
-
-    WHY default-style containers for triage buttons:
-      White/light tiles against the grey card background give natural
-      contrast without any colour overrides. selectAction makes the
-      entire container clickable — the label is centred within it —
-      giving us full-width, equal-sized tappable areas.
-
-    WHY emailId in button data:
-      When a button is pressed, Teams sends an Action.Submit payload to
-      the /api/messages endpoint. The messages function needs the Graph
-      message ID to know which email to move, flag, or delete. We embed
-      it here so no state lookup is required at action time.
-
-    WHY we pass token into _build_card:
-      Photo resolution requires a Graph API call. Rather than obtaining
-      a second token inside the photo helper, we pass the token already
-      acquired by the main digest loop. One token, one acquisition.
-
-    NOTE — View button deep link:
-      A proper per-message Outlook deep link requires URL-encoding the
-      Graph message ID. For now the View button opens the Outlook inbox.
-      Per-message deep links are a future refinement.
+    WHY time-aware rather than a fixed string:
+      A greeting that reflects the actual time of day feels slightly more
+      human than boilerplate. This is intentionally simple for now — a
+      future session will replace this with an AI-generated greeting that
+      varies in phrasing each run.
     """
-    # ── Extract email fields ──────────────────────────────────────────────────
-    sender_name  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
-    sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
-    subject      = (email.get("subject", "") or "(no subject)").strip()
-    body_preview = (email.get("bodyPreview", "") or "").strip()
-    email_id     = email.get("id", "")
+    hour = now_london.hour
+    if hour < 12:
+        return "Good morning, Phillip"
+    elif hour < 17:
+        return "Good afternoon, Phillip"
+    else:
+        return "Good evening, Phillip"
 
-    # Truncate preview to ~150 characters — keeps cards a consistent height
-    if len(body_preview) > 150:
-        body_preview = body_preview[:147] + "…"
 
-    # Convert received time to London local time for display
-    received_str = email.get("receivedDateTime", "")
-    try:
-        received_utc    = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
-        received_london = received_utc.astimezone(LONDON_TZ)
-        time_label      = received_london.strftime("%H:%M")
-    except Exception:
-        time_label = ""
+# ── Header card builder ────────────────────────────────────────────────────────
+def _build_header_card(
+    now_london:   datetime,
+    tz_label:     str,
+    last_run_utc: datetime | None,
+    email_count:  int,
+) -> dict:
+    """
+    Build the digest header card sent before the individual email cards.
 
-    # ── Resolve sender photo ──────────────────────────────────────────────────
-    # WHY we resolve photo per card rather than batching:
-    #   Each email may have a different sender. Batching would require
-    #   collecting all senders first, then resolving, then building cards —
-    #   more complex with no meaningful performance gain at typical digest
-    #   volumes (2–20 emails). Per-card resolution keeps the logic simple.
-    photo_uri = _get_sender_photo(token, sender_email) if sender_email else ENVELOPE_ICON
+    WHY a header card:
+      When several email cards arrive in sequence, the header gives
+      immediate context — how many emails are coming and what time window
+      they cover — before triage begins. It also acts as a clear visual
+      marker separating digest runs when scrolling back through channel
+      history.
 
-    # ── Build and return the card dict ────────────────────────────────────────
+    WHY no buttons:
+      The header is informational only. Action belongs on the individual
+      email cards, not the header.
+
+    WHY Warning colour (Refined Tangerine) on the greeting:
+      The same emphasis container used on email cards keeps the header
+      visually consistent with the batch it introduces. The accent colour
+      on the greeting line draws the eye naturally to the top of the
+      digest without being aggressive.
+
+    Content:
+      - Time-aware greeting (Good morning / afternoon / evening, Phillip)
+      - Current date and digest run time in London time
+      - Window covered (from last run to now)
+      - Email count in plain, grammatically correct language
+    """
+    greeting_text = _greeting(now_london)
+    date_str      = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
+
+    # Window: from last run (or "start of day" if first run) to now
+    if last_run_utc:
+        from_london = last_run_utc.astimezone(LONDON_TZ)
+        from_str    = from_london.strftime(f"%H:%M {tz_label}")
+    else:
+        from_str = "start of day"
+
+    to_str     = now_london.strftime(f"%H:%M {tz_label}")
+    window_str = f"Covering emails from {from_str} to {to_str}"
+
+    # WHY handle singular separately: "1 emails" is grammatically incorrect.
+    count_str = "1 email to triage" if email_count == 1 else f"{email_count} emails to triage"
+
     return {
         "type": "AdaptiveCard",
         "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
@@ -462,11 +459,117 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
                 "style": "emphasis",
                 "bleed": True,
                 "items": [
-                    # ── Sender row: photo + name, email address, timestamp ────
+                    # Greeting — accent colour, bold, large
+                    {
+                        "type": "TextBlock",
+                        "text": greeting_text,
+                        "weight": "Bolder",
+                        "size": "Large",
+                        "color": "Warning",
+                        "spacing": "None"
+                    },
+                    # Date and run time — subtle, small
+                    {
+                        "type": "TextBlock",
+                        "text": date_str,
+                        "isSubtle": True,
+                        "size": "Small",
+                        "spacing": "Small"
+                    },
+                    # Visual separator in accent colour
+                    # WHY a TextBlock separator rather than a Separator element:
+                    #   The built-in separator renders as a hairline in Teams
+                    #   which is barely visible on the emphasis background.
+                    #   A TextBlock of em-dashes in Warning colour gives a
+                    #   more visible, branded dividing line.
+                    {
+                        "type": "TextBlock",
+                        "text": "─────────────────────",
+                        "color": "Warning",
+                        "spacing": "Small"
+                    },
+                    # Digest window
+                    {
+                        "type": "TextBlock",
+                        "text": window_str,
+                        "wrap": True,
+                        "spacing": "Small"
+                    },
+                    # Email count — bold so it scans instantly
+                    {
+                        "type": "TextBlock",
+                        "text": count_str,
+                        "weight": "Bolder",
+                        "spacing": "Small"
+                    }
+                ]
+            }
+        ]
+    }
+
+
+# ── Adaptive Card builder ──────────────────────────────────────────────────────
+def _build_card(email: dict, tz_label: str, token: str) -> dict:
+    """
+    Build one Adaptive Card dict for a single email.
+
+    WHY one card per email:
+      The design principle is A&E triage — each email is a decision, and
+      the card is the triage interface. The individual card IS the triage.
+
+    WHY Container with style=emphasis as the outer wrapper:
+      Teams overrides backgroundColor on cards, so we use the native
+      emphasis style. bleed=True extends the background to the full card edge.
+
+    WHY default-style containers for triage buttons:
+      White/light tiles against the grey card background give natural
+      contrast. selectAction makes the entire container clickable.
+
+    WHY emailId in button data:
+      The messages function needs the Graph message ID to act on the
+      correct email when a button is pressed.
+
+    WHY we pass token into _build_card:
+      Photo resolution requires a Graph API call. Passing the token
+      already acquired by the main loop avoids a second acquisition.
+
+    NOTE — View button deep link:
+      Per-message Outlook deep links are a future refinement. For now
+      the View button opens the Outlook inbox.
+    """
+    sender_name  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
+    sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
+    subject      = (email.get("subject", "") or "(no subject)").strip()
+    body_preview = (email.get("bodyPreview", "") or "").strip()
+    email_id     = email.get("id", "")
+
+    if len(body_preview) > 150:
+        body_preview = body_preview[:147] + "…"
+
+    received_str = email.get("receivedDateTime", "")
+    try:
+        received_utc    = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
+        received_london = received_utc.astimezone(LONDON_TZ)
+        time_label      = received_london.strftime("%H:%M")
+    except Exception:
+        time_label = ""
+
+    photo_uri = _get_sender_photo(token, sender_email) if sender_email else ENVELOPE_ICON
+
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.5",
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": [
+                    # ── Sender row: photo + name, email, timestamp ────────────
                     {
                         "type": "ColumnSet",
                         "columns": [
-                            # Photo column — fixed width, vertically centred
                             {
                                 "type": "Column",
                                 "width": "auto",
@@ -482,7 +585,6 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
                                     }
                                 ]
                             },
-                            # Name + email + timestamp column
                             {
                                 "type": "Column",
                                 "width": "stretch",
@@ -665,9 +767,9 @@ def _get_delivery_config() -> tuple[str, str, str, str]:
     Retrieve the shared Bot Framework delivery config.
 
     WHY extracted as a helper:
-      Both _send_text_to_teams and _send_card_to_teams need the same four
-      values. Extracting them avoids repetition and keeps each send
-      function focused on its payload format only.
+      Both send functions need the same four values. Extracting them
+      avoids repetition and keeps each send function focused on its
+      payload format only.
 
     Returns: (bot_token, service_url, conversation_id, bot_app_id)
     """
@@ -712,15 +814,11 @@ def _send_card_to_teams(card: dict) -> None:
     via the Bot Framework Connector API.
 
     WHY attachments with contentType adaptive card:
-      The Bot Framework Connector expects Adaptive Cards wrapped in an
-      attachments array with the contentType set to the adaptive card
-      MIME type. Without this wrapper Teams renders the card JSON as
-      raw text rather than a rendered card.
+      Without this wrapper Teams renders the card JSON as raw text
+      rather than a rendered card.
 
     WHY Bot Framework Connector (not Graph API):
-      The digest is delivered as a bot message — it appears as Monica
-      speaking in the channel. Graph's /chats endpoint works differently
-      and requires additional permissions. The Bot Framework Connector
+      The digest appears as a bot message. The Bot Framework Connector
       is the correct path for bot-originated messages.
     """
     bot_token, service_url, conversation, bot_app_id = _get_delivery_config()
