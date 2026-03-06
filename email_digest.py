@@ -18,12 +18,19 @@ Session 19 change:
   Plain text formatting replaced with Adaptive Cards. One card per
   email, ordered newest first. Each card contains sender details,
   subject, body preview, and four triage action buttons.
+
+Session 20 change:
+  Sender profile photo added to each card. Resolution order:
+    1. Internal M365 user photo (Graph /users/{email}/photo/$value)
+    2. Saved contact photo (Graph /me/contacts filtered by email)
+    3. Envelope icon fallback (embedded SVG, no external dependency)
 """
 
 import os
 import json
 import logging
 import time
+import base64
 import requests
 import azure.functions as func
 
@@ -46,6 +53,21 @@ BLOB_NAME      = "last_run.txt"              # stores the ISO timestamp of the l
 #   A small delay keeps us well within the per-second limit without
 #   meaningfully slowing delivery — 20 cards still arrive in under 10 seconds.
 CARD_SEND_DELAY = 0.3
+
+# WHY an embedded SVG rather than a hosted URL:
+#   An external URL would create a runtime dependency on a third-party host.
+#   If that host is unavailable, every card in the digest would show a broken
+#   image. Embedding the icon as a base64 data URI means it always renders,
+#   with zero external dependencies. Teams Adaptive Cards support data URIs
+#   in Image elements.
+ENVELOPE_ICON = (
+    "data:image/svg+xml;base64,"
+    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAy"
+    "NCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjODg4ODg4IiBzdHJva2Utd2lkdGg9IjEuNSIg"
+    "c3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIj48cmVjdCB4"
+    "PSIyIiB5PSI0IiB3aWR0aD0iMjAiIGhlaWdodD0iMTYiIHJ4PSIyIiByeT0iMiIvPjxwb2x5"
+    "bGluZSBwb2ludHM9IjIsNCAxMiwxMyAyMiw0Ii8+PC9zdmc+"
+)
 
 
 # ── Timer Trigger ─────────────────────────────────────────────────────────────
@@ -104,7 +126,7 @@ def emailDigest(timer: func.TimerRequest) -> None:
     # WHY newest first: emails already arrive ordered by receivedDateTime desc
     # from the Graph query. No re-sorting needed.
     for email in emails:
-        card = _build_card(email, tz_label)
+        card = _build_card(email, tz_label, token)
         _send_card_to_teams(card)
         time.sleep(CARD_SEND_DELAY)   # avoid Bot Framework rate limits
 
@@ -223,6 +245,83 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     return emails
 
 
+# ── Sender photo resolution ────────────────────────────────────────────────────
+def _get_sender_photo(token: str, sender_email: str) -> str:
+    """
+    Resolve a sender's profile photo to a base64 data URI.
+
+    WHY base64 data URI rather than a URL:
+      Graph photo endpoints return raw binary image data, not a URL. They
+      also require an authorisation header — they cannot be used as a src
+      attribute in an Adaptive Card Image element directly. Converting to
+      a base64 data URI packages the binary as a self-contained string that
+      Adaptive Cards can render without any further HTTP calls or auth.
+
+    WHY image/jpeg as the MIME type regardless of file extension:
+      JPEG images use the MIME type image/jpeg whether the file on disk is
+      named .jpg or .jpeg. The extension is irrelevant to the binary format.
+      Graph always returns JPEG data from its photo endpoints, so
+      image/jpeg is always correct here.
+
+    Resolution order:
+      1. Internal M365 user — Graph /users/{email}/photo/$value
+         Works for anyone in the same tenant (colleagues, licensed users).
+      2. Saved contact — Graph /me/contacts filtered by email address,
+         then fetch that contact's stored photo.
+         Works for external senders Phillip has saved with a photo.
+      3. Envelope icon fallback — the ENVELOPE_ICON constant defined above.
+         Used when neither lookup finds a photo. Always succeeds.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # ── Attempt 1: internal M365 user photo ──────────────────────────────────
+    try:
+        resp = requests.get(
+            f"https://graph.microsoft.com/v1.0/users/{sender_email}/photo/$value",
+            headers=headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            encoded = base64.b64encode(resp.content).decode("utf-8")
+            logging.info(f"emailDigest: internal photo found for {sender_email}")
+            return f"data:image/jpeg;base64,{encoded}"
+    except Exception as e:
+        logging.debug(f"emailDigest: internal photo lookup failed for {sender_email} — {e}")
+
+    # ── Attempt 2: saved contact photo ───────────────────────────────────────
+    # WHY filter by emailAddresses/any():
+    #   A contact can have multiple email addresses. The any() OData
+    #   operator checks all of them, so we catch contacts regardless of
+    #   which address was used as the primary.
+    try:
+        search_url = (
+            "https://graph.microsoft.com/v1.0/me/contacts"
+            f"?$filter=emailAddresses/any(e:e/address eq '{sender_email}')"
+            "&$select=id,displayName"
+            "&$top=1"
+        )
+        search_resp = requests.get(search_url, headers=headers, timeout=10)
+        if search_resp.status_code == 200:
+            contacts = search_resp.json().get("value", [])
+            if contacts:
+                contact_id = contacts[0]["id"]
+                photo_resp = requests.get(
+                    f"https://graph.microsoft.com/v1.0/me/contacts/{contact_id}/photo/$value",
+                    headers=headers,
+                    timeout=10,
+                )
+                if photo_resp.status_code == 200:
+                    encoded = base64.b64encode(photo_resp.content).decode("utf-8")
+                    logging.info(f"emailDigest: contact photo found for {sender_email}")
+                    return f"data:image/jpeg;base64,{encoded}"
+    except Exception as e:
+        logging.debug(f"emailDigest: contact photo lookup failed for {sender_email} — {e}")
+
+    # ── Attempt 3: envelope icon fallback ────────────────────────────────────
+    logging.debug(f"emailDigest: no photo found for {sender_email} — using envelope icon")
+    return ENVELOPE_ICON
+
+
 # ── Blob Storage helpers ───────────────────────────────────────────────────────
 def _get_blob_client():
     """
@@ -286,7 +385,7 @@ def _fmt_time(dt: datetime, tz_label: str) -> str:
 
 
 # ── Adaptive Card builder ──────────────────────────────────────────────────────
-def _build_card(email: dict, tz_label: str) -> dict:
+def _build_card(email: dict, tz_label: str, token: str) -> dict:
     """
     Build one Adaptive Card dict for a single email.
 
@@ -314,17 +413,15 @@ def _build_card(email: dict, tz_label: str) -> dict:
       message ID to know which email to move, flag, or delete. We embed
       it here so no state lookup is required at action time.
 
-    NOTE — sender profile photo:
-      The Graph /users/{email}/photo endpoint returns binary, not a URL,
-      so it cannot be used directly in an Adaptive Card image element.
-      Photo display is deferred to a future session when contact
-      enrichment is added to the people intelligence layer.
+    WHY we pass token into _build_card:
+      Photo resolution requires a Graph API call. Rather than obtaining
+      a second token inside the photo helper, we pass the token already
+      acquired by the main digest loop. One token, one acquisition.
 
     NOTE — View button deep link:
       A proper per-message Outlook deep link requires URL-encoding the
-      Graph message ID, which is a long opaque string. For Session 19
-      the View button opens the Outlook inbox. Per-message deep links
-      are a future refinement.
+      Graph message ID. For now the View button opens the Outlook inbox.
+      Per-message deep links are a future refinement.
     """
     # ── Extract email fields ──────────────────────────────────────────────────
     sender_name  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
@@ -346,6 +443,14 @@ def _build_card(email: dict, tz_label: str) -> dict:
     except Exception:
         time_label = ""
 
+    # ── Resolve sender photo ──────────────────────────────────────────────────
+    # WHY we resolve photo per card rather than batching:
+    #   Each email may have a different sender. Batching would require
+    #   collecting all senders first, then resolving, then building cards —
+    #   more complex with no meaningful performance gain at typical digest
+    #   volumes (2–20 emails). Per-card resolution keeps the logic simple.
+    photo_uri = _get_sender_photo(token, sender_email) if sender_email else ENVELOPE_ICON
+
     # ── Build and return the card dict ────────────────────────────────────────
     return {
         "type": "AdaptiveCard",
@@ -357,10 +462,27 @@ def _build_card(email: dict, tz_label: str) -> dict:
                 "style": "emphasis",
                 "bleed": True,
                 "items": [
-                    # ── Sender row: name, email address, timestamp ────────────
+                    # ── Sender row: photo + name, email address, timestamp ────
                     {
                         "type": "ColumnSet",
                         "columns": [
+                            # Photo column — fixed width, vertically centred
+                            {
+                                "type": "Column",
+                                "width": "auto",
+                                "verticalContentAlignment": "Center",
+                                "spacing": "Small",
+                                "items": [
+                                    {
+                                        "type": "Image",
+                                        "url": photo_uri,
+                                        "size": "Small",
+                                        "style": "Person",
+                                        "altText": f"Photo of {sender_name}"
+                                    }
+                                ]
+                            },
+                            # Name + email + timestamp column
                             {
                                 "type": "Column",
                                 "width": "stretch",
