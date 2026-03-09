@@ -1225,8 +1225,9 @@ def _create_channel_conversation(
     url     = f"{service_url}/v3/conversations"
     team_id = os.environ["TEAMS_TEAM_ID"]
     body    = {
-        "bot": {"id": f"28:{bot_app_id}", "name": "Monica"},
+        "bot": {"id": f"28:{bot_app_id}", "name": "Leo"},
         "isGroup": True,
+        "members": [],
         "channelData": {
             "channel": {"id": channel_id},
             "team":    {"id": team_id},
