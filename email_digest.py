@@ -1227,10 +1227,8 @@ def _create_channel_conversation(
     body    = {
         "bot": {"id": f"28:{bot_app_id}", "name": "Leo"},
         "isGroup": True,
-        "members": [],
         "channelData": {
             "channel": {"id": channel_id},
-            "team":    {"id": team_id},
             "tenant":  {"id": tenant_id},
         },
     }
