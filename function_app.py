@@ -12,7 +12,7 @@ WHY this file exists:
   crashes only that Blueprint. If this file itself crashes, all functions
   go down — so it must stay simple and free of logic.
 
-Current function inventory (13 timer triggers + 3 HTTP triggers = 16 total):
+Current function inventory (14 timer triggers + 3 HTTP triggers = 17 total):
 
   File                  Function                    Type
   ─────────────────────────────────────────────────────────────────────────
@@ -31,6 +31,7 @@ Current function inventory (13 timer triggers + 3 HTTP triggers = 16 total):
   task_sunday.py        createSundayTasks           Timer — Sunday 17:00 UTC
   task_monthly.py       createMonthlyTasks          Timer — 1st of month 05:00 UTC
   task_keepalive.py     keepAlive                   Timer — every 4 minutes
+  task_guardian.py      taskGuardian                Timer — daily 06:00 UTC
 """
 
 import azure.functions as func
@@ -55,6 +56,7 @@ from task_friday      import bp as bp_friday
 from task_sunday      import bp as bp_sunday
 from task_monthly     import bp as bp_monthly
 from task_keepalive   import bp as bp_keepalive
+from task_guardian    import bp as bp_guardian
 
 # ── App initialisation ────────────────────────────────────────────────────────
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -79,6 +81,7 @@ app.register_blueprint(bp_friday)
 app.register_blueprint(bp_sunday)
 app.register_blueprint(bp_monthly)
 app.register_blueprint(bp_keepalive)
+app.register_blueprint(bp_guardian)
 
 
 # ── Ping health-check ─────────────────────────────────────────────────────────
