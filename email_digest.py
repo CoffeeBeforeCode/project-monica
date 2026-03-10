@@ -37,6 +37,11 @@ Session 22 fix:
     channelData now contains channel, team, and tenant as required by
     the Bot Framework ConversationParameters schema for Teams channels.
 
+Session 24 diagnostic:
+  - _create_channel_conversation now logs the full request body before
+    sending, so Application Insights shows exactly what is being posted
+    to /v3/conversations. Remove this line once the 400 error is resolved.
+
 Slot logic:
   First slot  (weather + agenda + digest):
     Mon–Sat: 05:00 UTC
@@ -1221,6 +1226,13 @@ def _create_channel_conversation(
       Logging resp.text first preserves the Bot Framework's exact error
       message in Application Insights, which is the only way to know
       what the API is rejecting.
+
+    WHY log the request body before sending (Session 24 diagnostic):
+      The body is logged at INFO level immediately before the POST so
+      that Application Insights shows exactly what was sent. This lets
+      us confirm that channel_id, bot_app_id, and tenant_id are resolving
+      correctly from environment variables at runtime — not just what the
+      code intends to send. Remove this line once the 400 error is resolved.
     """
     url     = f"{service_url}/v3/conversations"
     team_id = os.environ["TEAMS_TEAM_ID"]
@@ -1232,6 +1244,10 @@ def _create_channel_conversation(
             "tenant":  {"id": tenant_id},
         },
     }
+
+    # SESSION 24 DIAGNOSTIC — remove once 400 error is resolved
+    logging.info(f"emailDigest: conversation creation body — {body}")
+
     resp = requests.post(
         url,
         headers={
