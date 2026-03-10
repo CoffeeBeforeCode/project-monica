@@ -37,10 +37,14 @@ Session 22 fix:
     channelData now contains channel, team, and tenant as required by
     the Bot Framework ConversationParameters schema for Teams channels.
 
-Session 24 diagnostic:
-  - _create_channel_conversation now logs the full request body before
-    sending, so Application Insights shows exactly what is being posted
-    to /v3/conversations. Remove this line once the 400 error is resolved.
+Session 24 fix:
+  - _create_channel_conversation removed entirely. The 19:...@thread.tacv2
+    channel ID is itself a valid Bot Framework conversation ID for a Teams
+    channel. POST /v3/conversations was returning 400 BadSyntax on every
+    call because the conversation already exists — it does not need to be
+    created. Both _send_text_to_teams and _send_card_to_teams now post
+    directly to the channel ID. Confirmed working via curl test in Session
+    24 (201 response, message appeared in Daily Operations channel).
 
 Slot logic:
   First slot  (weather + agenda + digest):
@@ -1162,117 +1166,36 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
 
 
 # ── Teams delivery ─────────────────────────────────────────────────────────────
-def _get_delivery_config() -> tuple[str, str, str, str, str]:
+def _get_delivery_config() -> tuple[str, str, str, str]:
     """
     Shared Bot Framework delivery config for both send functions.
 
-    WHY five values returned (previously four):
-      The tenant ID is now required to create a channel conversation via
-      the Bot Framework Connector. It is read from the TENANT_ID app
-      setting, which is already present in the Function App.
+    WHY four values (previously five):
+      tenant_id is no longer needed now that delivery posts directly to
+      the channel ID. bot_token, service_url, channel_id, and bot_app_id
+      are all that is required.
     """
     bot_token   = _get_bot_token()
     service_url = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
     channel_id  = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
     bot_app_id  = os.environ["BOT_APP_ID"]
-    tenant_id   = os.environ["TENANT_ID"]
-    return bot_token, service_url, channel_id, bot_app_id, tenant_id
-
-
-def _create_channel_conversation(
-    bot_token:   str,
-    service_url: str,
-    channel_id:  str,
-    bot_app_id:  str,
-    tenant_id:   str,
-) -> str:
-    """
-    Create a Bot Framework conversation in a Teams channel and return
-    the conversation ID to post activities into.
-
-    WHY this step is required:
-      The Bot Framework Connector rejects activities sent directly to a
-      Teams channel thread ID (19:...@thread.tacv2) with 403 Forbidden.
-      You must first POST to /v3/conversations to register a new
-      conversation, passing the channel ID in channelData. The API
-      returns a conversation ID that accepts subsequent activities.
-
-    WHY the bot ID uses the '28:' prefix:
-      The Bot Framework identifies bots with a '28:' namespace prefix.
-      The BOT_APP_ID environment variable stores the raw Azure AD app ID
-      (a GUID). Without the prefix the conversation creation call returns
-      400 Bad Request because the bot identity is not recognised.
-
-    WHY no 'activity' field in the body:
-      The activity field is not valid on the conversation creation
-      endpoint and causes a 400 error. The initial message, if any,
-      is sent as a separate POST to the returned conversation ID.
-
-    WHY channelData requires channel, team, and tenant:
-      The Bot Framework needs all three to locate the destination.
-      channel identifies the specific thread. team identifies which
-      Team that channel belongs to — without it the Bot Framework cannot
-      resolve the channel ID unambiguously. tenant identifies the M365
-      organisation. All three are required for channel conversations.
-
-    WHY TEAMS_TEAM_ID is read inside this function rather than passed in:
-      The team ID is only needed here — not by any other delivery
-      function. Reading it locally keeps the call signatures clean and
-      avoids threading a value through _get_delivery_config that nothing
-      else uses.
-
-    WHY log resp.text before raise_for_status:
-      raise_for_status() discards the response body when it throws.
-      Logging resp.text first preserves the Bot Framework's exact error
-      message in Application Insights, which is the only way to know
-      what the API is rejecting.
-
-    WHY log the request body before sending (Session 24 diagnostic):
-      The body is logged at INFO level immediately before the POST so
-      that Application Insights shows exactly what was sent. This lets
-      us confirm that channel_id, bot_app_id, and tenant_id are resolving
-      correctly from environment variables at runtime — not just what the
-      code intends to send. Remove this line once the 400 error is resolved.
-    """
-    url     = f"{service_url}/v3/conversations"
-    team_id = os.environ["TEAMS_TEAM_ID"]
-    body    = {
-        "bot": {"id": f"28:{bot_app_id}", "name": "Leo"},
-        "isGroup": True,
-        "channelData": {
-            "channel": {"id": channel_id},
-            "tenant":  {"id": tenant_id},
-        },
-    }
-
-    # SESSION 24 DIAGNOSTIC — remove once 400 error is resolved
-    logging.info(f"emailDigest: conversation creation body — {body}")
-
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {bot_token}",
-            "Content-Type":  "application/json",
-        },
-        json=body,
-        timeout=15,
-    )
-    if not resp.ok:
-        logging.error(
-            f"emailDigest: conversation creation failed — "
-            f"{resp.status_code} — {resp.text}"
-        )
-    resp.raise_for_status()
-    return resp.json()["id"]
+    return bot_token, service_url, channel_id, bot_app_id
 
 
 def _send_text_to_teams(text: str) -> None:
-    """Plain-text message for the no-email case — lighter than a card."""
-    bot_token, service_url, channel_id, bot_app_id, tenant_id = _get_delivery_config()
-    conversation_id = _create_channel_conversation(
-        bot_token, service_url, channel_id, bot_app_id, tenant_id
-    )
-    url = f"{service_url}/v3/conversations/{conversation_id}/activities"
+    """
+    Plain-text message for the no-email case — lighter than a card.
+
+    WHY post directly to the channel ID:
+      The 19:...@thread.tacv2 thread ID is itself a valid Bot Framework
+      conversation ID for a Teams channel. POST /v3/conversations was
+      returning 400 BadSyntax because the conversation already exists —
+      it does not need to be created. Posting directly to the channel ID
+      is the correct pattern for proactive channel messaging. Confirmed
+      working via curl test in Session 24 (201 response, message delivered).
+    """
+    bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
+    url = f"{service_url}/v3/conversations/{channel_id}/activities"
 
     resp = requests.post(
         url,
@@ -1295,16 +1218,16 @@ def _send_card_to_teams(card: dict) -> None:
       Cards appear as bot messages. The Connector is the correct path
       for bot-originated messages and requires no additional permissions.
 
-    WHY a new conversation is created per card:
-      Each card gets its own thread for now — clean and simple. A future
-      session can refactor to share one conversation ID per digest run,
-      so all cards in a run appear as replies in the same thread.
+    WHY post directly to the channel ID:
+      The 19:...@thread.tacv2 thread ID is itself a valid Bot Framework
+      conversation ID for a Teams channel. POST /v3/conversations was
+      returning 400 BadSyntax because the conversation already exists —
+      it does not need to be created. Posting directly to the channel ID
+      is the correct pattern for proactive channel messaging. Confirmed
+      working via curl test in Session 24 (201 response, message delivered).
     """
-    bot_token, service_url, channel_id, bot_app_id, tenant_id = _get_delivery_config()
-    conversation_id = _create_channel_conversation(
-        bot_token, service_url, channel_id, bot_app_id, tenant_id
-    )
-    url = f"{service_url}/v3/conversations/{conversation_id}/activities"
+    bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
+    url = f"{service_url}/v3/conversations/{channel_id}/activities"
 
     payload = {
         "type": "message",
