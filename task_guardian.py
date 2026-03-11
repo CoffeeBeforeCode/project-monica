@@ -13,6 +13,15 @@
 #
 #   If everything is present, it logs a single clean OK line and exits.
 #   The cost of running this check daily is negligible.
+#
+# Session 25 fix:
+#   send_teams_alert rewritten to use the Bot Framework Connector API
+#   (same pattern as email_digest.py) rather than the Graph chatMessage
+#   endpoint. The Graph endpoint requires ChannelMessage.Send on the
+#   Managed Identity, which is a delegated-only permission and cannot be
+#   granted as an application permission. The Bot Framework pattern uses
+#   client credentials (BOT_APP_ID + BOT_CLIENT_SECRET) and posts directly
+#   to the channel ID — confirmed working in Session 24.
 import azure.functions as func
 import logging
 import os
@@ -22,6 +31,8 @@ bp = func.Blueprint()
 USER_ID       = "cda66539-6f2a-4a27-a5a3-a493061f8711"
 HOME_LIST_ID  = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
 ADMIN_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA="
+
+
 def get_access_token() -> str | None:
     """
     Why: Acquires a token from the Managed Identity endpoint. No stored
@@ -44,6 +55,36 @@ def get_access_token() -> str | None:
     except Exception as e:
         logging.error(f"Guardian: Token acquisition failed: {e}")
         return None
+
+
+def _get_bot_token() -> str:
+    """
+    Why: Acquires a Bot Framework token via client credentials flow.
+    Separate from the Graph token because the Bot Framework and Graph
+    use different OAuth audiences and cannot share a token.
+    The same pattern is used in email_digest.py — kept identical so
+    the two files behave consistently.
+    App settings required (already present):
+      BOT_APP_ID, BOT_CLIENT_SECRET, TENANT_ID
+    """
+    bot_app_id = os.environ["BOT_APP_ID"]
+    bot_secret = os.environ["BOT_CLIENT_SECRET"]
+    tenant_id  = os.environ["TENANT_ID"]
+
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        data={
+            "grant_type":    "client_credentials",
+            "client_id":     bot_app_id,
+            "client_secret": bot_secret,
+            "scope":         "https://api.botframework.com/.default",
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
 def today_utc_at(hour: int, minute: int = 0) -> datetime:
     """
     Why: Returns today's date at the given UTC hour as an aware datetime.
@@ -51,6 +92,8 @@ def today_utc_at(hour: int, minute: int = 0) -> datetime:
     """
     now = datetime.now(timezone.utc)
     return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
 def task_exists_today(token: str, list_id: str, title: str) -> bool:
     """
     Why: Checks whether a task with the given title was created today (UTC)
@@ -81,6 +124,8 @@ def task_exists_today(token: str, list_id: str, title: str) -> bool:
     except Exception as e:
         logging.error(f"Guardian: task_exists_today failed for '{title}': {e}")
         return False
+
+
 def create_todo_task(token: str, list_id: str, title: str, category: str,
                      due_utc: datetime = None, reminder_utc: datetime = None) -> bool:
     """
@@ -108,52 +153,84 @@ def create_todo_task(token: str, list_id: str, title: str, category: str,
     else:
         logging.error(f"Guardian: Failed to recover '{title}' — {response.status_code} {response.text}")
         return False
-def send_teams_alert(token: str, recovered: list[str]) -> None:
+
+
+def send_teams_alert(recovered: list[str]) -> None:
     """
-    Why: Posts a plain-text alert directly to the Daily Operations channel via
-    the Graph API chatMessage endpoint. This is intentionally simpler than the
-    Bot Framework connector — it requires only ChannelMessage.Send on the
-    Managed Identity (see deployment note below).
-    The recovery logic does not depend on this alert succeeding. If the
-    permission is not yet granted, the alert fails and logs an error, but
-    the tasks are already created. Recovery always happens; visibility is
-    best-effort until the permission is confirmed.
-    DEPLOYMENT NOTE: Before this alert will work, add ChannelMessage.Send
-    to the Managed Identity in Azure AD. This is a separate step from the
-    existing Tasks.ReadWrite.All and Files.Read.All permissions already granted.
-    App settings required (already present from Session 21/22):
-      TEAMS_TEAM_ID               — the Monica Team ID
-      TEAMS_DAILY_OPERATIONS_ID   — the Daily Operations channel thread ID
+    Why: Posts a plain-text alert to the Daily Operations channel via the
+    Bot Framework Connector API — the same direct-post pattern confirmed
+    working in Session 24.
+
+    Why Bot Framework rather than Graph chatMessage:
+      Graph's POST /teams/{id}/channels/{id}/messages requires
+      ChannelMessage.Send, which is a delegated-only permission. It cannot
+      be granted to a Managed Identity as an application permission, making
+      it unavailable to a timer-triggered Function with no signed-in user.
+      The Bot Framework Connector uses client credentials (BOT_APP_ID and
+      BOT_CLIENT_SECRET) and posts directly to the channel thread ID —
+      no additional permissions required beyond what is already in place.
+
+    Why the Graph token is not passed in:
+      This function uses the Bot Framework token, not the Graph token.
+      The two are obtained separately and serve different APIs.
+
+    App settings required (already present):
+      BOT_APP_ID, BOT_CLIENT_SECRET, TENANT_ID,
+      TEAMS_SERVICE_URL, TEAMS_DAILY_OPERATIONS_ID
     """
-    team_id    = os.environ.get("TEAMS_TEAM_ID")
-    channel_id = os.environ.get("TEAMS_DAILY_OPERATIONS_ID")
-    if not team_id or not channel_id:
+    service_url = os.environ.get("TEAMS_SERVICE_URL", "").rstrip("/")
+    channel_id  = os.environ.get("TEAMS_DAILY_OPERATIONS_ID")
+    bot_app_id  = os.environ.get("BOT_APP_ID")
+
+    if not service_url or not channel_id or not bot_app_id:
         logging.warning(
             "Guardian: Teams alert skipped — "
-            "TEAMS_TEAM_ID or TEAMS_DAILY_OPERATIONS_ID not configured."
+            "TEAMS_SERVICE_URL, TEAMS_DAILY_OPERATIONS_ID or BOT_APP_ID not configured."
         )
         return
+
     task_lines = "\n".join(f"  • {t}" for t in recovered)
     message    = (
-        f"⚠️ Leo — Guardian Alert\n\n"
+        f"⚠️ Guardian Alert\n\n"
         f"The following tasks were not created at 05:00 UTC and have been recovered "
         f"at 05:15 UTC:\n\n{task_lines}\n\n"
         f"Cause: Azure recycled the Consumption plan instance during the 05:00 trigger "
-        f"window. Tasks are now in To Do. No action required from you."
+        f"window. Tasks are now in To Do. No action required."
     )
-    url      = f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels/{channel_id}/messages"
-    headers  = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    body     = {"body": {"content": message}}
+
     try:
-        response = requests.post(url, headers=headers, json=body, timeout=10)
-        if response.status_code in (200, 201):
-            logging.info("Guardian: Teams alert sent to Daily Operations.")
+        bot_token = _get_bot_token()
+    except Exception as e:
+        logging.error(f"Guardian: failed to acquire bot token for Teams alert — {e}")
+        return
+
+    url     = f"{service_url}/v3/conversations/{channel_id}/activities"
+    payload = {
+        "type": "message",
+        "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
+        "text": message,
+    }
+
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {bot_token}",
+                "Content-Type":  "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            logging.info("Guardian: Teams alert delivered to Daily Operations.")
         else:
             logging.error(
-                f"Guardian: Teams alert failed — {response.status_code} {response.text}"
+                f"Guardian: Teams alert failed — {resp.status_code} {resp.text}"
             )
     except Exception as e:
         logging.error(f"Guardian: Teams alert exception: {e}")
+
+
 def get_expected_tasks_today() -> list[dict]:
     """
     Why: The single source of truth for what tasks should exist on any given day.
@@ -213,10 +290,10 @@ def get_expected_tasks_today() -> list[dict]:
                 "due_utc":  morning,
             },
             {
-                "list_id":     HOME_LIST_ID,
-                "title":       "Vacuum: through and dust",
-                "category":    "[00] System",
-                "due_utc":     morning,
+                "list_id":      HOME_LIST_ID,
+                "title":        "Vacuum: through and dust",
+                "category":     "[00] System",
+                "due_utc":      morning,
                 "reminder_utc": today_utc_at(9, 0),
             },
         ]
@@ -238,10 +315,10 @@ def get_expected_tasks_today() -> list[dict]:
                 "due_utc":  morning,
             },
             {
-                "list_id":     HOME_LIST_ID,
-                "title":       "Vacuum: through and dust",
-                "category":    "[00] System",
-                "due_utc":     morning,
+                "list_id":      HOME_LIST_ID,
+                "title":        "Vacuum: through and dust",
+                "category":     "[00] System",
+                "due_utc":      morning,
                 "reminder_utc": today_utc_at(9, 0),
             },
         ]
@@ -257,10 +334,10 @@ def get_expected_tasks_today() -> list[dict]:
     elif weekday == 4:  # Friday
         tasks += [
             {
-                "list_id":     HOME_LIST_ID,
-                "title":       "Vacuum: through and dust",
-                "category":    "[00] System",
-                "due_utc":     morning,
+                "list_id":      HOME_LIST_ID,
+                "title":        "Vacuum: through and dust",
+                "category":     "[00] System",
+                "due_utc":      morning,
                 "reminder_utc": today_utc_at(9, 0),
             },
         ]
@@ -287,6 +364,8 @@ def get_expected_tasks_today() -> list[dict]:
                 "due_utc":  morning,
             })
     return tasks
+
+
 @bp.timer_trigger(
     schedule="0 15 5 * * *",   # 05:15 UTC every day
     arg_name="timer",
@@ -329,6 +408,6 @@ def taskGuardian(timer: func.TimerRequest) -> None:
         logging.warning(
             f"taskGuardian: Recovered {len(recovered)} missing task(s): {recovered}"
         )
-        send_teams_alert(token, recovered)
+        send_teams_alert(recovered)
     else:
         logging.info("taskGuardian: All expected tasks present. No recovery needed. ✓")
