@@ -46,6 +46,12 @@ Session 24 fix:
     directly to the channel ID. Confirmed working via curl test in Session
     24 (201 response, message appeared in Daily Operations channel).
 
+Session 25 fix:
+  - from.name set to "Leo" in both _send_text_to_teams and
+    _send_card_to_teams. Previously the name field was absent, causing
+    Teams to fall back to the Azure Bot registration name "monica-bot".
+    Adding the explicit name field overrides this at the activity level.
+
 Slot logic:
   First slot  (weather + agenda + digest):
     Mon–Sat: 05:00 UTC
@@ -1193,6 +1199,11 @@ def _send_text_to_teams(text: str) -> None:
       it does not need to be created. Posting directly to the channel ID
       is the correct pattern for proactive channel messaging. Confirmed
       working via curl test in Session 24 (201 response, message delivered).
+
+    WHY from.name is "Leo":
+      Without an explicit name field, Teams falls back to the Azure Bot
+      registration name ("monica-bot"). Setting it here overrides that
+      at the activity level so all messages appear as sent by Leo.
     """
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
@@ -1200,7 +1211,11 @@ def _send_text_to_teams(text: str) -> None:
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
-        json={"type": "message", "from": {"id": f"28:{bot_app_id}"}, "text": text},
+        json={
+            "type": "message",
+            "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
+            "text": text,
+        },
         timeout=15,
     )
     resp.raise_for_status()
@@ -1225,13 +1240,18 @@ def _send_card_to_teams(card: dict) -> None:
       it does not need to be created. Posting directly to the channel ID
       is the correct pattern for proactive channel messaging. Confirmed
       working via curl test in Session 24 (201 response, message delivered).
+
+    WHY from.name is "Leo":
+      Without an explicit name field, Teams falls back to the Azure Bot
+      registration name ("monica-bot"). Setting it here overrides that
+      at the activity level so all messages appear as sent by Leo.
     """
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
 
     payload = {
         "type": "message",
-        "from": {"id": f"28:{bot_app_id}"},
+        "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
         "attachments": [
             {
                 "contentType": "application/vnd.microsoft.card.adaptive",
