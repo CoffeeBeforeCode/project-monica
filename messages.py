@@ -20,6 +20,11 @@ Triage actions (wired to email digest Adaptive Card buttons):
   waiting   — move to Waiting For folder, create Waiting For task in 5 days
   delete    — delete the email permanently
 
+Session 25 fix:
+  - reply_text updated from "Monica here" to Leo's voice.
+  - from.name set to "Leo" in _send_reply. Previously absent, causing
+    Teams to fall back to the Azure Bot registration name "monica-bot".
+
 WHY this file is self-contained:
   Same Blueprint pattern as all other Monica functions. A crash here
   affects only the bot endpoint — timers and task chains keep running.
@@ -121,8 +126,12 @@ def _handle_message(body: dict, service_url: str, conversation_id: str) -> None:
     text_in = body.get("text", "").strip()
     logging.info(f"messages: received text: {text_in!r}")
 
+    # WHY Leo's voice here:
+    #   The bot character is Leo McGarry. All user-facing text should
+    #   reflect that — "Monica here" was the previous placeholder from
+    #   before the character rename in Session 23.
     reply_text = (
-        "👋 Monica here. Command handling is coming in a future session. "
+        "👋 Leo here. Command handling is coming in a future session. "
         "I received your message."
     )
 
@@ -467,6 +476,11 @@ def _send_reply(
       Setting replyToId threads the reply under the original message in
       Teams, keeping the conversation tidy rather than posting a new
       top-level message.
+
+    WHY from.name is "Leo":
+      Without an explicit name field, Teams falls back to the Azure Bot
+      registration name ("monica-bot"). Setting it here overrides that
+      at the activity level so replies appear as sent by Leo.
     """
     bot_token  = _get_bot_token()
     bot_app_id = os.environ["BOT_APP_ID"]
@@ -478,7 +492,7 @@ def _send_reply(
 
     payload = {
         "type":      "message",
-        "from":      {"id": bot_app_id},
+        "from":      {"id": bot_app_id, "name": "Leo"},
         "recipient": incoming_body.get("from", {}),
         "replyToId": incoming_body.get("id", ""),
         "text":      text,
