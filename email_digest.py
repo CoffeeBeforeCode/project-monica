@@ -1,9 +1,7 @@
 """
 email_digest.py — Monica Email Digest Timer Trigger
-
 Fires every 2 hours (05:00–19:00 UTC daily).
 On Sundays, the 05:00 slot is suppressed in code.
-
 Fetches emails received since the last digest run and delivers one
 Adaptive Card per email to the Teams Daily Operations channel via the
 Bot Framework Connector API.
@@ -52,25 +50,37 @@ Session 25 fix:
     Teams to fall back to the Azure Bot registration name "monica-bot".
     Adding the explicit name field overrides this at the activity level.
 
+Session 26 change:
+  - Email cards are now sent as a single Bot Framework message activity
+    with all cards in the attachments array, replacing the previous
+    one-card-per-POST loop. Teams anchors the channel view to the
+    bottom-most message; the old pattern meant landing on the last card
+    and scrolling up through every email before triaging — processing
+    each email twice. A single message with multiple attachments renders
+    the full batch as one stacked unit, and Teams lands on it correctly.
+  - Email order reversed: Graph returns emails newest-first
+    ($orderby=receivedDateTime desc). The list is reversed before sending
+    so the oldest email sits at the top of the stack and Phillip reads
+    chronologically top-to-bottom.
+  - CARD_SEND_DELAY removed from the email send path. The delay was a
+    Bot Framework rate-limit precaution for sequential POSTs. With a
+    single POST it is unnecessary.
+
 Slot logic:
   First slot  (weather + agenda + digest):
     Mon–Sat: 05:00 UTC
     Sun:     07:00 UTC  (05:00 is suppressed)
-
   Second slot (agenda + digest only):
     Mon–Sat: 07:00 UTC
     Sun:     09:00 UTC
-
   All other slots: email digest only
 """
-
 import os
 import logging
 import time
 import base64
 import requests
 import azure.functions as func
-
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from azure.storage.blob import BlobServiceClient
@@ -101,7 +111,6 @@ ENVELOPE_ICON = (
     "PSIyIiB5PSI0IiB3aWR0aD0iMjAiIGhlaWdodD0iMTYiIHJ4PSIyIiByeT0iMiIvPjxwb2x5"
     "bGluZSBwb2ludHM9IjIsNCAxMiwxMyAyMiw0Ii8+PC9zdmc+"
 )
-
 
 # ── Timer Trigger ─────────────────────────────────────────────────────────────
 @bp.timer_trigger(
@@ -175,7 +184,6 @@ def emailDigest(timer: func.TimerRequest) -> None:
 
     emails = _fetch_emails(token, last_run_utc)
     logging.info(f"emailDigest: fetched {len(emails)} emails")
-
     _write_last_run(now_utc)
 
     if not emails:
@@ -183,15 +191,24 @@ def emailDigest(timer: func.TimerRequest) -> None:
         _send_text_to_teams(f"📭 No new emails since last digest ({since_label}).")
         return
 
+    # WHY reversed: Graph returns emails newest-first ($orderby=receivedDateTime desc).
+    #   Reversing puts the oldest email at the top of the stacked card message
+    #   so Phillip reads chronologically top-to-bottom — the natural triage order.
+    emails = list(reversed(emails))
+
     header_card = _build_header_card(now_london, tz_label, last_run_utc, len(emails))
     _send_card_to_teams(header_card)
     time.sleep(CARD_SEND_DELAY)
 
-    for email in emails:
-        card = _build_card(email, tz_label, token)
-        _send_card_to_teams(card)
-        time.sleep(CARD_SEND_DELAY)
-
+    # WHY build all cards first, then send as one activity:
+    #   Teams anchors the channel view to the bottom-most message. The previous
+    #   pattern sent one card per POST, so Teams always landed on the last card —
+    #   forcing a scroll up through every email before triaging from the top.
+    #   A single message with all cards in the attachments array renders the
+    #   full batch stacked in order, and the channel anchors to the batch as
+    #   a whole. No double-scroll, no double-processing.
+    email_cards = [_build_card(email, tz_label, token) for email in emails]
+    _send_cards_to_teams(email_cards)
     logging.info(f"emailDigest: header + {len(emails)} email card(s) delivered")
 
 
@@ -199,7 +216,6 @@ def emailDigest(timer: func.TimerRequest) -> None:
 def get_access_token() -> str | None:
     """
     Obtain a Microsoft Graph access token via Managed Identity.
-
     WHY IDENTITY_ENDPOINT and IDENTITY_HEADER:
       Azure Functions provides these automatically at runtime. They point
       to a local token broker. The 169.254.169.254 VM metadata address
@@ -207,11 +223,9 @@ def get_access_token() -> str | None:
     """
     identity_endpoint = os.environ.get("IDENTITY_ENDPOINT")
     identity_header   = os.environ.get("IDENTITY_HEADER")
-
     if not identity_endpoint or not identity_header:
         logging.error("emailDigest: Managed Identity environment variables not set.")
         return None
-
     try:
         response = requests.get(
             f"{identity_endpoint}?api-version=2019-08-01&resource=https://graph.microsoft.com",
@@ -228,7 +242,6 @@ def get_access_token() -> str | None:
 def _get_bot_token() -> str:
     """
     Bot Framework access token via client credentials.
-
     WHY separate from the Graph token:
       Graph and Bot Framework use different OAuth audiences and
       credential flows. They cannot share a token.
@@ -236,7 +249,6 @@ def _get_bot_token() -> str:
     bot_app_id = os.environ["BOT_APP_ID"]
     bot_secret = os.environ["BOT_CLIENT_SECRET"]
     tenant_id  = os.environ["TENANT_ID"]
-
     resp = requests.post(
         f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
         data={
@@ -255,21 +267,17 @@ def _get_bot_token() -> str:
 def _fetch_weather() -> dict:
     """
     Fetch a 5-day forecast from Open-Meteo for Basingstoke RG21 5NP.
-
     WHY Open-Meteo:
       Free with no API key required — no Key Vault secret needed, no
       rate limit concerns at Monica's usage volume. Excellent UK coverage.
       Temperatures are returned in Celsius natively — no conversion needed.
-
     WHY daily rather than hourly:
       The morning card gives a day-level overview: today's high/low, rain
       probability, and wind. Hourly data is more detail than is useful
       at 05:00. The 4-day outlook uses daily data for the same reason.
-
     WHY windspeed_10m_max and winddirection_10m_dominant:
       These give the peak wind conditions for the day — more useful for
       planning than the average, which could mask a gusty afternoon.
-
     Returns a dict with keys:
       today: {description, emoji, high, low, rain_pct, wind_kmh, wind_dir}
       forecast: list of 4 dicts [{day_name, emoji, high, low}]
@@ -303,19 +311,16 @@ def _fetch_weather() -> dict:
 
     today    = parse_day(0)
     forecast = [parse_day(i) for i in range(1, 5)]
-
     return {"today": today, "forecast": forecast}
 
 
 def _wmo_to_label(code: int) -> tuple[str, str]:
     """
     Map a WMO weather interpretation code to an emoji and short description.
-
     WHY emoji in TextBlocks rather than weather icon images:
       External image URLs from adaptivecards.io are tied to their sample
       assets and have no guaranteed uptime. Emoji render natively in Teams
       TextBlocks with zero external dependency.
-
     WMO code reference: https://open-meteo.com/en/docs#weathervariables
     """
     mapping = {
@@ -350,7 +355,6 @@ def _wmo_to_label(code: int) -> tuple[str, str]:
 def _degrees_to_compass(degrees: float) -> str:
     """
     Convert a wind direction in degrees to a compass point.
-
     WHY compass rather than degrees:
       "Wind from the SW" is immediately meaningful. "Wind from 225°"
       requires mental conversion. Compass points are the right
@@ -366,16 +370,13 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
     """
     Build an Adaptive Card showing today's weather and a 4-day forecast
     for Basingstoke.
-
     WHY emphasis container:
       Consistent with all other Monica cards. Teams overrides background
       colours so we use the native emphasis style throughout.
-
     WHY today as large top section + 4 compact day columns below:
       Mirrors the WeatherLarge sample layout adapted for Teams constraints.
       Today gets the most detail (you need it now); the forecast columns
       give a quick week-at-a-glance.
-
     WHY Celsius with °C suffix:
       Phillip is in the UK. Fahrenheit would require mental conversion
       and the sample's F conversion formula is not needed here —
@@ -383,7 +384,6 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
     """
     today    = weather["today"]
     forecast = weather["forecast"]
-
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
     # Build the 4-day forecast columns
@@ -528,24 +528,20 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
 def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     """
     Fetch today's calendar events from Microsoft Graph.
-
     WHY calendarView rather than /events with a filter:
       calendarView automatically expands recurring events into individual
       instances. A filter on /events would only return the series master
       and miss individual occurrences — today's recurring team standup
       would not appear. calendarView is the correct endpoint for a
       day-view agenda.
-
     WHY today midnight to midnight in London time:
       We want events for the calendar day as Phillip experiences it —
       midnight to midnight in his local timezone, not UTC. An event at
       23:30 London time should appear in today's agenda even though it
       might be the following UTC day.
-
     WHY $orderby=start/dateTime:
       Events are returned in chronological order, which is the natural
       order for an agenda card.
-
     WHY $top=20:
       A day with more than 20 calendar events is unusual enough that
       we can safely cap here. If it does happen, the overflow is logged.
@@ -553,10 +549,8 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     london_now   = now_utc.astimezone(LONDON_TZ)
     day_start    = london_now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end      = day_start + timedelta(days=1)
-
     start_str    = day_start.isoformat()
     end_str      = day_end.isoformat()
-
     url = (
         f"https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711"
         f"/calendarView"
@@ -565,7 +559,6 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
         "&$orderby=start/dateTime"
         "&$top=20"
     )
-
     resp = requests.get(
         url,
         headers={"Authorization": f"Bearer {token}"},
@@ -573,11 +566,9 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     )
     resp.raise_for_status()
     data = resp.json()
-
     events = data.get("value", [])
     if data.get("@odata.nextLink"):
         logging.warning("emailDigest: more than 20 events today — some omitted")
-
     return events
 
 
@@ -585,17 +576,14 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
 def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) -> dict:
     """
     Build an Adaptive Card listing today's calendar events.
-
     WHY one card for all events rather than one card per event:
       The agenda is a planning tool — you want to scan the whole day at
       once, not triage individual meetings. A single card with all events
       is the right form for this use case.
-
     WHY we show all-day events differently:
       All-day events (bank holidays, out-of-office markers) have no
       meaningful start/end time to display. We label them as "All day"
       to distinguish them from timed meetings.
-
     WHY we show the organiser for non-personal events:
       For meetings organised by someone else, knowing who called it adds
       useful context at a glance. For events you organised yourself, the
@@ -758,20 +746,20 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
 def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     """
     Fetch emails from the Inbox received after `since`.
-
     WHY $filter on receivedDateTime:
       Graph filters server-side, keeping the payload small.
-
     WHY top=100:
       A 2-hour window on a busy inbox might exceed the default 50-item
       limit. 100 is a reasonable ceiling.
-
     WHY bodyPreview and id in $select:
       bodyPreview populates the card preview. id is embedded in each
       triage button so messages.py knows which email to act on.
+    WHY $orderby=receivedDateTime desc:
+      Graph returns newest-first. The list is reversed after fetching
+      (see emailDigest()) so cards stack oldest-at-top inside the single
+      Teams message — the natural chronological triage order.
     """
     headers = {"Authorization": f"Bearer {token}"}
-
     if since:
         since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
@@ -779,7 +767,6 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
         since_str = two_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     filter_clause = f"receivedDateTime ge {since_str}"
-
     url = (
         "https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711"
         "/mailFolders/Inbox/messages"
@@ -788,15 +775,12 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
         "&$select=id,subject,from,receivedDateTime,categories,isRead,bodyPreview"
         "&$orderby=receivedDateTime desc"
     )
-
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-
     emails = data.get("value", [])
     if data.get("@odata.nextLink"):
         logging.warning("emailDigest: more than 100 emails in window — some omitted")
-
     return emails
 
 
@@ -804,23 +788,19 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
 def _get_sender_photo(token: str, sender_email: str) -> str:
     """
     Resolve a sender's profile photo to a base64 data URI.
-
     WHY base64 data URI:
       Graph photo endpoints return binary data requiring an auth header —
       they cannot be used directly as Image src URLs in Adaptive Cards.
       A data URI is self-contained and requires no further HTTP calls.
-
     WHY image/jpeg regardless of file extension:
       JPEG images use MIME type image/jpeg whether stored as .jpg or .jpeg.
       Graph always returns JPEG binary from its photo endpoints.
-
     Resolution order:
       1. Internal M365 user photo
       2. Saved contact photo
       3. Envelope icon fallback
     """
     headers = {"Authorization": f"Bearer {token}"}
-
     try:
         resp = requests.get(
             f"https://graph.microsoft.com/v1.0/users/{sender_email}/photo/$value",
@@ -916,7 +896,6 @@ def _build_header_card(
 ) -> dict:
     """
     Digest header card sent before the individual email cards.
-
     WHY no buttons: informational only.
     WHY Warning colour on greeting: draws the eye to the top of the batch.
     """
@@ -986,7 +965,6 @@ def _build_header_card(
 def _build_card(email: dict, tz_label: str, token: str) -> dict:
     """
     Build one Adaptive Card for a single email.
-
     WHY one card per email: A&E triage model — each email is a decision.
     WHY emailId in button data: messages.py needs it to act on the right email.
     WHY pass token: photo resolution requires a Graph call.
@@ -1175,7 +1153,6 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
 def _get_delivery_config() -> tuple[str, str, str, str]:
     """
     Shared Bot Framework delivery config for both send functions.
-
     WHY four values (previously five):
       tenant_id is no longer needed now that delivery posts directly to
       the channel ID. bot_token, service_url, channel_id, and bot_app_id
@@ -1191,7 +1168,6 @@ def _get_delivery_config() -> tuple[str, str, str, str]:
 def _send_text_to_teams(text: str) -> None:
     """
     Plain-text message for the no-email case — lighter than a card.
-
     WHY post directly to the channel ID:
       The 19:...@thread.tacv2 thread ID is itself a valid Bot Framework
       conversation ID for a Teams channel. POST /v3/conversations was
@@ -1199,7 +1175,6 @@ def _send_text_to_teams(text: str) -> None:
       it does not need to be created. Posting directly to the channel ID
       is the correct pattern for proactive channel messaging. Confirmed
       working via curl test in Session 24 (201 response, message delivered).
-
     WHY from.name is "Leo":
       Without an explicit name field, Teams falls back to the Azure Bot
       registration name ("monica-bot"). Setting it here overrides that
@@ -1207,7 +1182,6 @@ def _send_text_to_teams(text: str) -> None:
     """
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
-
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
@@ -1225,14 +1199,14 @@ def _send_text_to_teams(text: str) -> None:
 def _send_card_to_teams(card: dict) -> None:
     """
     Post a single Adaptive Card via the Bot Framework Connector API.
-
+    Used for: weather card, agenda card, and digest header card.
+    These remain as individual messages — only the per-email triage cards
+    are consolidated into a single message (see _send_cards_to_teams).
     WHY attachments with adaptive card contentType:
       Without this wrapper Teams renders the JSON as raw text.
-
     WHY Bot Framework Connector (not Graph API):
       Cards appear as bot messages. The Connector is the correct path
       for bot-originated messages and requires no additional permissions.
-
     WHY post directly to the channel ID:
       The 19:...@thread.tacv2 thread ID is itself a valid Bot Framework
       conversation ID for a Teams channel. POST /v3/conversations was
@@ -1240,7 +1214,6 @@ def _send_card_to_teams(card: dict) -> None:
       it does not need to be created. Posting directly to the channel ID
       is the correct pattern for proactive channel messaging. Confirmed
       working via curl test in Session 24 (201 response, message delivered).
-
     WHY from.name is "Leo":
       Without an explicit name field, Teams falls back to the Azure Bot
       registration name ("monica-bot"). Setting it here overrides that
@@ -1248,7 +1221,6 @@ def _send_card_to_teams(card: dict) -> None:
     """
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
-
     payload = {
         "type": "message",
         "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
@@ -1259,7 +1231,6 @@ def _send_card_to_teams(card: dict) -> None:
             }
         ],
     }
-
     resp = requests.post(
         url,
         headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
@@ -1268,3 +1239,60 @@ def _send_card_to_teams(card: dict) -> None:
     )
     resp.raise_for_status()
     logging.info(f"emailDigest: card delivered — status {resp.status_code}")
+
+
+def _send_cards_to_teams(cards: list[dict]) -> None:
+    """
+    Post multiple Adaptive Cards as a single Bot Framework message activity.
+    Used for: the per-email triage card batch.
+    WHY a single activity with multiple attachments:
+      Teams anchors the channel view to the bottom-most message. Sending
+      N cards as N separate activities means Teams lands on the last card,
+      forcing a scroll up and a double-pass over every email before
+      triaging from the top. A single activity with all cards in the
+      attachments array arrives as one message — Teams renders them
+      stacked in order, and the user sees the full batch from the top
+      without scrolling.
+    WHY no CARD_SEND_DELAY:
+      The delay between individual sends was a Bot Framework rate-limit
+      precaution. With a single POST there is nothing to throttle.
+    WHY attachments list built with a list comprehension:
+      Each entry in the attachments array follows the same structure —
+      contentType + content. Building it inline keeps the payload
+      construction readable and avoids a separate loop variable.
+    """
+    if not cards:
+        # WHY guard: an empty list would send a contentless message activity.
+        return
+
+    bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
+    url = f"{service_url}/v3/conversations/{channel_id}/activities"
+
+    payload = {
+        "type": "message",
+        "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
+        # WHY: each card becomes one entry in the attachments array.
+        # The Bot Framework passes all of them through to Teams in order.
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card,
+            }
+            for card in cards
+        ],
+    }
+
+    resp = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {bot_token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    logging.info(
+        f"emailDigest: {len(cards)} email card(s) delivered as single message"
+        f" — status {resp.status_code}"
+    )
