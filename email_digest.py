@@ -549,8 +549,12 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     london_now   = now_utc.astimezone(LONDON_TZ)
     day_start    = london_now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end      = day_start + timedelta(days=1)
-    start_str    = day_start.isoformat()
-    end_str      = day_end.isoformat()
+    # WHY strftime rather than isoformat:
+#   isoformat() on a timezone-aware datetime produces +00:00 or +01:00
+#   suffixes which Graph's calendarView endpoint rejects with a 400.
+#   strftime produces a clean naive datetime string that Graph accepts.
+start_str = day_start.strftime("%Y-%m-%dT%H:%M:%S")
+end_str   = day_end.strftime("%Y-%m-%dT%H:%M:%S")
     url = (
         f"https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711"
         f"/calendarView"
