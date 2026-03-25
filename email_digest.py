@@ -367,30 +367,14 @@ def _degrees_to_compass(degrees: float) -> str:
 
 # ── Weather card builder ───────────────────────────────────────────────────────
 def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> dict:
-    """
-    Build an Adaptive Card showing today's weather and a 4-day forecast
-    for Basingstoke.
-    WHY emphasis container:
-      Consistent with all other Monica cards. Teams overrides background
-      colours so we use the native emphasis style throughout.
-    WHY today as large top section + 4 compact day columns below:
-      Mirrors the WeatherLarge sample layout adapted for Teams constraints.
-      Today gets the most detail (you need it now); the forecast columns
-      give a quick week-at-a-glance.
-    WHY Celsius with °C suffix:
-      Phillip is in the UK. Fahrenheit would require mental conversion
-      and the sample's F conversion formula is not needed here —
-      Open-Meteo returns Celsius natively.
-    """
     today    = weather["today"]
     forecast = weather["forecast"]
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
-    # Build the 4-day forecast columns
     forecast_columns = []
     for day in forecast:
         dt       = datetime.strptime(day["date"], "%Y-%m-%d")
-        day_name = dt.strftime("%a")   # Mon, Tue etc.
+        day_name = dt.strftime("%a")
         forecast_columns.append({
             "type": "Column",
             "width": "stretch",
@@ -439,7 +423,6 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                 "style": "emphasis",
                 "bleed": True,
                 "items": [
-                    # ── Header ────────────────────────────────────────────────
                     {
                         "type": "TextBlock",
                         "text": "🌦️ WEATHER — BASINGSTOKE",
@@ -454,7 +437,6 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                         "size": "Small",
                         "spacing": "None"
                     },
-                    # ── Today: big emoji + condition + detail ─────────────────
                     {
                         "type": "ColumnSet",
                         "spacing": "Medium",
@@ -505,14 +487,12 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                             }
                         ]
                     },
-                    # ── Separator ─────────────────────────────────────────────
                     {
                         "type": "TextBlock",
                         "text": "─────────────────────",
                         "color": "Warning",
                         "spacing": "Small"
                     },
-                    # ── 4-day forecast columns ────────────────────────────────
                     {
                         "type": "ColumnSet",
                         "spacing": "Small",
@@ -531,30 +511,19 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     WHY calendarView rather than /events with a filter:
       calendarView automatically expands recurring events into individual
       instances. A filter on /events would only return the series master
-      and miss individual occurrences — today's recurring team standup
-      would not appear. calendarView is the correct endpoint for a
-      day-view agenda.
+      and miss individual occurrences.
     WHY today midnight to midnight in London time:
-      We want events for the calendar day as Phillip experiences it —
-      midnight to midnight in his local timezone, not UTC. An event at
-      23:30 London time should appear in today's agenda even though it
-      might be the following UTC day.
-    WHY $orderby=start/dateTime:
-      Events are returned in chronological order, which is the natural
-      order for an agenda card.
-    WHY $top=20:
-      A day with more than 20 calendar events is unusual enough that
-      we can safely cap here. If it does happen, the overflow is logged.
+      We want events for the calendar day as Phillip experiences it.
+    WHY strftime rather than isoformat:
+      isoformat() on a timezone-aware datetime produces +00:00 or +01:00
+      suffixes which Graph's calendarView endpoint rejects with a 400.
+      strftime produces a clean naive datetime string that Graph accepts.
     """
-    london_now   = now_utc.astimezone(LONDON_TZ)
-    day_start    = london_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    day_end      = day_start + timedelta(days=1)
-    # WHY strftime rather than isoformat:
-#   isoformat() on a timezone-aware datetime produces +00:00 or +01:00
-#   suffixes which Graph's calendarView endpoint rejects with a 400.
-#   strftime produces a clean naive datetime string that Graph accepts.
-start_str = day_start.strftime("%Y-%m-%dT%H:%M:%S")
-end_str   = day_end.strftime("%Y-%m-%dT%H:%M:%S")
+    london_now = now_utc.astimezone(LONDON_TZ)
+    day_start  = london_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end    = day_start + timedelta(days=1)
+    start_str  = day_start.strftime("%Y-%m-%dT%H:%M:%S")
+    end_str    = day_end.strftime("%Y-%m-%dT%H:%M:%S")
     url = (
         f"https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711"
         f"/calendarView"
@@ -578,21 +547,6 @@ end_str   = day_end.strftime("%Y-%m-%dT%H:%M:%S")
 
 # ── Agenda card builder ────────────────────────────────────────────────────────
 def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) -> dict:
-    """
-    Build an Adaptive Card listing today's calendar events.
-    WHY one card for all events rather than one card per event:
-      The agenda is a planning tool — you want to scan the whole day at
-      once, not triage individual meetings. A single card with all events
-      is the right form for this use case.
-    WHY we show all-day events differently:
-      All-day events (bank holidays, out-of-office markers) have no
-      meaningful start/end time to display. We label them as "All day"
-      to distinguish them from timed meetings.
-    WHY we show the organiser for non-personal events:
-      For meetings organised by someone else, knowing who called it adds
-      useful context at a glance. For events you organised yourself, the
-      organiser line would be noise, so we omit it.
-    """
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
     if not events:
@@ -608,30 +562,23 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
     else:
         event_items = []
         for i, event in enumerate(events):
-            # ── Format time ───────────────────────────────────────────────────
             if event.get("isAllDay"):
                 time_str = "All day"
             else:
                 try:
-                    start_dt     = datetime.fromisoformat(
+                    start_dt = datetime.fromisoformat(
                         event["start"]["dateTime"]
                     ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
-                    end_dt       = datetime.fromisoformat(
+                    end_dt   = datetime.fromisoformat(
                         event["end"]["dateTime"]
                     ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
-                    time_str     = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+                    time_str = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
                 except Exception:
                     time_str = ""
 
-            # ── Subject ───────────────────────────────────────────────────────
-            subject = (event.get("subject") or "No title").strip()
+            subject  = (event.get("subject") or "No title").strip()
+            location = (event.get("location", {}).get("displayName", "") or "").strip()
 
-            # ── Location (optional) ───────────────────────────────────────────
-            location = (
-                event.get("location", {}).get("displayName", "") or ""
-            ).strip()
-
-            # ── Organiser (optional — omit if self-organised) ─────────────────
             organiser_email = (
                 event.get("organizer", {})
                      .get("emailAddress", {})
@@ -648,14 +595,12 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                      .get("name", "")
             )
 
-            # ── Separator between events ──────────────────────────────────────
             spacing = "Small" if i == 0 else "Medium"
 
             event_items.append({
                 "type": "ColumnSet",
                 "spacing": spacing,
                 "columns": [
-                    # Time column — fixed width, right-aligned
                     {
                         "type": "Column",
                         "width": "auto",
@@ -671,7 +616,6 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                             }
                         ]
                     },
-                    # Event detail column
                     {
                         "type": "Column",
                         "width": "stretch",
@@ -685,7 +629,6 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                                     "wrap": True,
                                     "spacing": "None"
                                 },
-                                # Location — only shown if present
                                 {
                                     "type": "TextBlock",
                                     "text": f"📍 {location}",
@@ -694,7 +637,6 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                                     "wrap": True,
                                     "spacing": "None"
                                 } if location else None,
-                                # Organiser — only shown if not self-organised
                                 {
                                     "type": "TextBlock",
                                     "text": f"👤 {organiser_name}",
@@ -750,18 +692,10 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
 def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     """
     Fetch emails from the Inbox received after `since`.
-    WHY $filter on receivedDateTime:
-      Graph filters server-side, keeping the payload small.
-    WHY top=100:
-      A 2-hour window on a busy inbox might exceed the default 50-item
-      limit. 100 is a reasonable ceiling.
-    WHY bodyPreview and id in $select:
-      bodyPreview populates the card preview. id is embedded in each
-      triage button so messages.py knows which email to act on.
-    WHY $orderby=receivedDateTime desc:
-      Graph returns newest-first. The list is reversed after fetching
-      (see emailDigest()) so cards stack oldest-at-top inside the single
-      Teams message — the natural chronological triage order.
+    WHY $filter on receivedDateTime: Graph filters server-side, keeping payload small.
+    WHY top=100: a 2-hour window on a busy inbox might exceed the default 50-item limit.
+    WHY $orderby=receivedDateTime desc: list is reversed after fetching so cards stack
+      oldest-at-top — the natural chronological triage order.
     """
     headers = {"Authorization": f"Bearer {token}"}
     if since:
@@ -792,17 +726,7 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
 def _get_sender_photo(token: str, sender_email: str) -> str:
     """
     Resolve a sender's profile photo to a base64 data URI.
-    WHY base64 data URI:
-      Graph photo endpoints return binary data requiring an auth header —
-      they cannot be used directly as Image src URLs in Adaptive Cards.
-      A data URI is self-contained and requires no further HTTP calls.
-    WHY image/jpeg regardless of file extension:
-      JPEG images use MIME type image/jpeg whether stored as .jpg or .jpeg.
-      Graph always returns JPEG binary from its photo endpoints.
-    Resolution order:
-      1. Internal M365 user photo
-      2. Saved contact photo
-      3. Envelope icon fallback
+    Resolution order: internal M365 user photo → saved contact photo → envelope fallback.
     """
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -878,10 +802,6 @@ def _fmt_time(dt: datetime, tz_label: str) -> str:
 
 
 def _greeting(now_london: datetime) -> str:
-    """
-    Time-aware greeting for the header card.
-    Future session: replace with AI-generated greeting that varies each run.
-    """
     hour = now_london.hour
     if hour < 12:
         return "Good morning, Phillip"
@@ -898,11 +818,6 @@ def _build_header_card(
     last_run_utc: datetime | None,
     email_count:  int,
 ) -> dict:
-    """
-    Digest header card sent before the individual email cards.
-    WHY no buttons: informational only.
-    WHY Warning colour on greeting: draws the eye to the top of the batch.
-    """
     greeting_text = _greeting(now_london)
     date_str      = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
 
@@ -967,13 +882,6 @@ def _build_header_card(
 
 # ── Email card builder ─────────────────────────────────────────────────────────
 def _build_card(email: dict, tz_label: str, token: str) -> dict:
-    """
-    Build one Adaptive Card for a single email.
-    WHY one card per email: A&E triage model — each email is a decision.
-    WHY emailId in button data: messages.py needs it to act on the right email.
-    WHY pass token: photo resolution requires a Graph call.
-    NOTE View button: per-message deep link is a future refinement.
-    """
     sender_name  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
     sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
     subject      = (email.get("subject", "") or "(no subject)").strip()
@@ -1155,13 +1063,6 @@ def _build_card(email: dict, tz_label: str, token: str) -> dict:
 
 # ── Teams delivery ─────────────────────────────────────────────────────────────
 def _get_delivery_config() -> tuple[str, str, str, str]:
-    """
-    Shared Bot Framework delivery config for both send functions.
-    WHY four values (previously five):
-      tenant_id is no longer needed now that delivery posts directly to
-      the channel ID. bot_token, service_url, channel_id, and bot_app_id
-      are all that is required.
-    """
     bot_token   = _get_bot_token()
     service_url = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
     channel_id  = os.environ["TEAMS_DAILY_OPERATIONS_ID"]
@@ -1170,20 +1071,6 @@ def _get_delivery_config() -> tuple[str, str, str, str]:
 
 
 def _send_text_to_teams(text: str) -> None:
-    """
-    Plain-text message for the no-email case — lighter than a card.
-    WHY post directly to the channel ID:
-      The 19:...@thread.tacv2 thread ID is itself a valid Bot Framework
-      conversation ID for a Teams channel. POST /v3/conversations was
-      returning 400 BadSyntax because the conversation already exists —
-      it does not need to be created. Posting directly to the channel ID
-      is the correct pattern for proactive channel messaging. Confirmed
-      working via curl test in Session 24 (201 response, message delivered).
-    WHY from.name is "Leo":
-      Without an explicit name field, Teams falls back to the Azure Bot
-      registration name ("monica-bot"). Setting it here overrides that
-      at the activity level so all messages appear as sent by Leo.
-    """
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
     resp = requests.post(
@@ -1201,28 +1088,6 @@ def _send_text_to_teams(text: str) -> None:
 
 
 def _send_card_to_teams(card: dict) -> None:
-    """
-    Post a single Adaptive Card via the Bot Framework Connector API.
-    Used for: weather card, agenda card, and digest header card.
-    These remain as individual messages — only the per-email triage cards
-    are consolidated into a single message (see _send_cards_to_teams).
-    WHY attachments with adaptive card contentType:
-      Without this wrapper Teams renders the JSON as raw text.
-    WHY Bot Framework Connector (not Graph API):
-      Cards appear as bot messages. The Connector is the correct path
-      for bot-originated messages and requires no additional permissions.
-    WHY post directly to the channel ID:
-      The 19:...@thread.tacv2 thread ID is itself a valid Bot Framework
-      conversation ID for a Teams channel. POST /v3/conversations was
-      returning 400 BadSyntax because the conversation already exists —
-      it does not need to be created. Posting directly to the channel ID
-      is the correct pattern for proactive channel messaging. Confirmed
-      working via curl test in Session 24 (201 response, message delivered).
-    WHY from.name is "Leo":
-      Without an explicit name field, Teams falls back to the Azure Bot
-      registration name ("monica-bot"). Setting it here overrides that
-      at the activity level so all messages appear as sent by Leo.
-    """
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
     payload = {
@@ -1248,25 +1113,15 @@ def _send_card_to_teams(card: dict) -> None:
 def _send_cards_to_teams(cards: list[dict]) -> None:
     """
     Post multiple Adaptive Cards as a single Bot Framework message activity.
-    Used for: the per-email triage card batch.
     WHY a single activity with multiple attachments:
-      Teams anchors the channel view to the bottom-most message. Sending
-      N cards as N separate activities means Teams lands on the last card,
-      forcing a scroll up and a double-pass over every email before
-      triaging from the top. A single activity with all cards in the
-      attachments array arrives as one message — Teams renders them
-      stacked in order, and the user sees the full batch from the top
-      without scrolling.
+      Teams anchors the channel view to the bottom-most message. A single
+      activity with all cards in the attachments array arrives as one message —
+      Teams renders them stacked in order from the top without scrolling.
     WHY no CARD_SEND_DELAY:
-      The delay between individual sends was a Bot Framework rate-limit
-      precaution. With a single POST there is nothing to throttle.
-    WHY attachments list built with a list comprehension:
-      Each entry in the attachments array follows the same structure —
-      contentType + content. Building it inline keeps the payload
-      construction readable and avoids a separate loop variable.
+      The delay was a rate-limit precaution for sequential POSTs.
+      With a single POST there is nothing to throttle.
     """
     if not cards:
-        # WHY guard: an empty list would send a contentless message activity.
         return
 
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
@@ -1275,8 +1130,6 @@ def _send_cards_to_teams(cards: list[dict]) -> None:
     payload = {
         "type": "message",
         "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
-        # WHY: each card becomes one entry in the attachments array.
-        # The Bot Framework passes all of them through to Teams in order.
         "attachments": [
             {
                 "contentType": "application/vnd.microsoft.card.adaptive",
