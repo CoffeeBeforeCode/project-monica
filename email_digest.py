@@ -2,9 +2,9 @@
 email_digest.py — Monica Email Digest Timer Trigger
 Fires every 2 hours (05:00–19:00 UTC daily).
 On Sundays, the 05:00 slot is suppressed in code.
-Fetches emails received since the last digest run and delivers one
-Adaptive Card per email to the Teams Daily Operations channel via the
-Bot Framework Connector API.
+Fetches emails received since the last digest run and delivers them as a
+single concertina Adaptive Card to the Teams Daily Operations channel via
+the Bot Framework Connector API.
 
 WHY this file is self-contained:
   Each Blueprint file owns its own get_access_token() so that one
@@ -22,49 +22,40 @@ Session 20 additions:
 
 Session 21 fix:
   - _create_channel_conversation added to resolve 403 Forbidden error.
-    The Bot Framework Connector does not accept a raw Teams channel thread
-    ID as a conversation target. A conversation must first be created via
-    POST /v3/conversations, and the returned ID used for posting. The bot
-    ID must carry the '28:' prefix required by the Bot Framework.
 
 Session 22 fix:
   - _create_channel_conversation now logs the full Bot Framework response
-    body before raising on error, so the exact rejection reason is visible
-    in Application Insights traces rather than only the HTTP status code.
-  - Conversation creation body corrected: root-level tenantId removed;
-    channelData now contains channel, team, and tenant as required by
-    the Bot Framework ConversationParameters schema for Teams channels.
+    body before raising on error.
 
 Session 24 fix:
   - _create_channel_conversation removed entirely. The 19:...@thread.tacv2
-    channel ID is itself a valid Bot Framework conversation ID for a Teams
-    channel. POST /v3/conversations was returning 400 BadSyntax on every
-    call because the conversation already exists — it does not need to be
-    created. Both _send_text_to_teams and _send_card_to_teams now post
-    directly to the channel ID. Confirmed working via curl test in Session
-    24 (201 response, message appeared in Daily Operations channel).
+    channel ID is itself a valid Bot Framework conversation ID.
 
 Session 25 fix:
   - from.name set to "Leo" in both _send_text_to_teams and
-    _send_card_to_teams. Previously the name field was absent, causing
-    Teams to fall back to the Azure Bot registration name "monica-bot".
-    Adding the explicit name field overrides this at the activity level.
+    _send_card_to_teams.
 
 Session 26 change:
-  - Email cards are now sent as a single Bot Framework message activity
-    with all cards in the attachments array, replacing the previous
-    one-card-per-POST loop. Teams anchors the channel view to the
-    bottom-most message; the old pattern meant landing on the last card
-    and scrolling up through every email before triaging — processing
-    each email twice. A single message with multiple attachments renders
-    the full batch as one stacked unit, and Teams lands on it correctly.
-  - Email order reversed: Graph returns emails newest-first
-    ($orderby=receivedDateTime desc). The list is reversed before sending
-    so the oldest email sits at the top of the stack and Phillip reads
-    chronologically top-to-bottom.
-  - CARD_SEND_DELAY removed from the email send path. The delay was a
-    Bot Framework rate-limit precaution for sequential POSTs. With a
-    single POST it is unnecessary.
+  - Email cards sent as a single Bot Framework message activity.
+  - Email order reversed for chronological triage.
+  - CARD_SEND_DELAY removed from email send path.
+
+Session 29 changes:
+  - Greeting card is now the very first message in every digest run,
+    before weather and agenda. It includes the email count so Phillip
+    knows the workload before anything else is delivered.
+  - Emails fetched before greeting is sent so the count is available.
+  - All-day events from the previous day are filtered out. Graph's
+    calendarView boundary is inclusive on startDateTime, which causes
+    yesterday's all-day event (ending exactly at today's midnight) to
+    appear in the agenda. A post-fetch filter removes it.
+  - Concertina email card replaces the previous one-card-per-email and
+    multi-attachment patterns. All emails are delivered as a single
+    Adaptive Card with collapsed rows. Each row shows sender, subject,
+    and received time. Tapping a row expands the body preview and triage
+    buttons via Action.ToggleVisibility.
+  - _build_header_card, _build_card, and _send_cards_to_teams removed.
+  - _build_greeting_card and _build_concertina_card added.
 
 Slot logic:
   First slot  (weather + agenda + digest):
@@ -89,9 +80,9 @@ from azure.storage.blob import BlobServiceClient
 bp = func.Blueprint()
 
 # ── Constants ────────────────────────────────────────────────────────────────
-LONDON_TZ      = ZoneInfo("Europe/London")
-BLOB_CONTAINER = "monica-digest"
-BLOB_NAME      = "last_run.txt"
+LONDON_TZ       = ZoneInfo("Europe/London")
+BLOB_CONTAINER  = "monica-digest"
+BLOB_NAME       = "last_run.txt"
 CARD_SEND_DELAY = 0.3
 
 # Basingstoke RG21 5NP coordinates
@@ -111,6 +102,7 @@ ENVELOPE_ICON = (
     "PSIyIiB5PSI0IiB3aWR0aD0iMjAiIGhlaWdodD0iMTYiIHJ4PSIyIiByeT0iMiIvPjxwb2x5"
     "bGluZSBwb2ludHM9IjIsNCAxMiwxMyAyMiw0Ii8+PC9zdmc+"
 )
+
 
 # ── Timer Trigger ─────────────────────────────────────────────────────────────
 @bp.timer_trigger(
@@ -149,13 +141,38 @@ def emailDigest(timer: func.TimerRequest) -> None:
         logging.error("emailDigest: no access token — aborting")
         return
 
-    # ── First slot: send weather card ─────────────────────────────────────────
+    # ── Fetch emails before sending anything ─────────────────────────────────
+    # WHY fetch emails first:
+    #   The greeting card states how many emails there are. We need the
+    #   count before sending the first message. Fetching early also means
+    #   last_run is written at the start of delivery, not after — so a
+    #   crash mid-send does not cause duplicate emails on the next run.
+    last_run_utc = _read_last_run()
+    logging.info(
+        f"emailDigest: last run was "
+        f"{last_run_utc.isoformat() if last_run_utc else 'never'}"
+    )
+    emails = _fetch_emails(token, last_run_utc)
+    logging.info(f"emailDigest: fetched {len(emails)} emails")
+    _write_last_run(now_utc)
+
+    # ── Step 1: Greeting card (always first) ──────────────────────────────────
+    # WHY greeting first:
+    #   Leo greets Phillip before delivering any briefing. The greeting
+    #   includes the email count so the workload is known immediately,
+    #   before weather and agenda are read.
+    greeting_card = _build_greeting_card(now_london, tz_label, len(emails))
+    _send_card_to_teams(greeting_card)
+    time.sleep(CARD_SEND_DELAY)
+    logging.info("emailDigest: greeting card delivered")
+
+    # ── Step 2: Weather card (first slot only) ────────────────────────────────
     # WHY weather only on first slot:
     #   The weather card sets up the day. Repeating it every 2 hours
     #   would be noise. Once in the morning is the right cadence.
     if is_first_slot:
         try:
-            weather = _fetch_weather()
+            weather      = _fetch_weather()
             weather_card = _build_weather_card(weather, now_london, tz_label)
             _send_card_to_teams(weather_card)
             time.sleep(CARD_SEND_DELAY)
@@ -163,53 +180,38 @@ def emailDigest(timer: func.TimerRequest) -> None:
         except Exception as e:
             logging.error(f"emailDigest: weather card failed — {e}")
 
-    # ── First and second slot: send agenda card ───────────────────────────────
+    # ── Step 3: Agenda card (first and second slot) ───────────────────────────
     # WHY agenda on both first and second slot:
-    #   First slot gives the full day view at wake-up. Second slot (07:00
-    #   or 09:00 on Sunday) is a useful reminder before the day starts
-    #   properly. After that, repeating the agenda would be noise.
+    #   First slot gives the full day view at wake-up. Second slot is a
+    #   useful reminder before the day starts properly. After that,
+    #   repeating the agenda would be noise.
     if is_first_slot or is_second_slot:
         try:
-            events = _fetch_calendar_events(token, now_utc)
+            events      = _fetch_calendar_events(token, now_utc)
             agenda_card = _build_agenda_card(events, now_london, tz_label)
             _send_card_to_teams(agenda_card)
             time.sleep(CARD_SEND_DELAY)
-            logging.info(f"emailDigest: agenda card delivered — {len(events)} event(s)")
+            logging.info(
+                f"emailDigest: agenda card delivered — {len(events)} event(s)"
+            )
         except Exception as e:
             logging.error(f"emailDigest: agenda card failed — {e}")
 
-    # ── All slots: email digest ───────────────────────────────────────────────
-    last_run_utc = _read_last_run()
-    logging.info(f"emailDigest: last run was {last_run_utc.isoformat() if last_run_utc else 'never'}")
-
-    emails = _fetch_emails(token, last_run_utc)
-    logging.info(f"emailDigest: fetched {len(emails)} emails")
-    _write_last_run(now_utc)
-
+    # ── Step 4: Email concertina card (all slots) ─────────────────────────────
     if not emails:
-        since_label = _fmt_time(last_run_utc or now_utc, tz_label)
-        _send_text_to_teams(f"📭 No new emails since last digest ({since_label}).")
+        # Greeting already told Phillip the inbox is clear. Nothing more to send.
         return
 
-    # WHY reversed: Graph returns emails newest-first ($orderby=receivedDateTime desc).
-    #   Reversing puts the oldest email at the top of the stacked card message
-    #   so Phillip reads chronologically top-to-bottom — the natural triage order.
+    # WHY reversed: Graph returns emails newest-first (receivedDateTime desc).
+    #   Reversing puts the oldest email at the top so Phillip reads
+    #   chronologically top-to-bottom — the natural triage order.
     emails = list(reversed(emails))
 
-    header_card = _build_header_card(now_london, tz_label, last_run_utc, len(emails))
-    _send_card_to_teams(header_card)
-    time.sleep(CARD_SEND_DELAY)
-
-    # WHY build all cards first, then send as one activity:
-    #   Teams anchors the channel view to the bottom-most message. The previous
-    #   pattern sent one card per POST, so Teams always landed on the last card —
-    #   forcing a scroll up through every email before triaging from the top.
-    #   A single message with all cards in the attachments array renders the
-    #   full batch stacked in order, and the channel anchors to the batch as
-    #   a whole. No double-scroll, no double-processing.
-    email_cards = [_build_card(email, tz_label, token) for email in emails]
-    _send_cards_to_teams(email_cards)
-    logging.info(f"emailDigest: header + {len(emails)} email card(s) delivered")
+    concertina_card = _build_concertina_card(emails, tz_label, token, now_london)
+    _send_card_to_teams(concertina_card)
+    logging.info(
+        f"emailDigest: concertina card delivered — {len(emails)} email(s)"
+    )
 
 
 # ── Authentication ─────────────────────────────────────────────────────────────
@@ -228,9 +230,10 @@ def get_access_token() -> str | None:
         return None
     try:
         response = requests.get(
-            f"{identity_endpoint}?api-version=2019-08-01&resource=https://graph.microsoft.com",
+            f"{identity_endpoint}?api-version=2019-08-01"
+            f"&resource=https://graph.microsoft.com",
             headers={"X-IDENTITY-HEADER": identity_header},
-            timeout=10
+            timeout=10,
         )
         response.raise_for_status()
         return response.json().get("access_token")
@@ -270,14 +273,10 @@ def _fetch_weather() -> dict:
     WHY Open-Meteo:
       Free with no API key required — no Key Vault secret needed, no
       rate limit concerns at Monica's usage volume. Excellent UK coverage.
-      Temperatures are returned in Celsius natively — no conversion needed.
+      Temperatures are returned in Celsius natively.
     WHY daily rather than hourly:
-      The morning card gives a day-level overview: today's high/low, rain
-      probability, and wind. Hourly data is more detail than is useful
-      at 05:00. The 4-day outlook uses daily data for the same reason.
-    WHY windspeed_10m_max and winddirection_10m_dominant:
-      These give the peak wind conditions for the day — more useful for
-      planning than the average, which could mask a gusty afternoon.
+      The morning card gives a day-level overview. Hourly data is more
+      detail than is useful at 05:00.
     Returns a dict with keys:
       today: {description, emoji, high, low, rain_pct, wind_kmh, wind_dir}
       forecast: list of 4 dicts [{day_name, emoji, high, low}]
@@ -296,17 +295,17 @@ def _fetch_weather() -> dict:
     data = resp.json()["daily"]
 
     def parse_day(i: int) -> dict:
-        code     = data["weathercode"][i]
+        code       = data["weathercode"][i]
         emoji, desc = _wmo_to_label(code)
         return {
-            "date":      data["time"][i],
-            "emoji":     emoji,
-            "desc":      desc,
-            "high":      round(data["temperature_2m_max"][i]),
-            "low":       round(data["temperature_2m_min"][i]),
-            "rain_pct":  data["precipitation_probability_max"][i],
-            "wind_kmh":  round(data["windspeed_10m_max"][i]),
-            "wind_dir":  _degrees_to_compass(data["winddirection_10m_dominant"][i]),
+            "date":     data["time"][i],
+            "emoji":    emoji,
+            "desc":     desc,
+            "high":     round(data["temperature_2m_max"][i]),
+            "low":      round(data["temperature_2m_min"][i]),
+            "rain_pct": data["precipitation_probability_max"][i],
+            "wind_kmh": round(data["windspeed_10m_max"][i]),
+            "wind_dir": _degrees_to_compass(data["winddirection_10m_dominant"][i]),
         }
 
     today    = parse_day(0)
@@ -318,10 +317,8 @@ def _wmo_to_label(code: int) -> tuple[str, str]:
     """
     Map a WMO weather interpretation code to an emoji and short description.
     WHY emoji in TextBlocks rather than weather icon images:
-      External image URLs from adaptivecards.io are tied to their sample
-      assets and have no guaranteed uptime. Emoji render natively in Teams
-      TextBlocks with zero external dependency.
-    WMO code reference: https://open-meteo.com/en/docs#weathervariables
+      External image URLs have no guaranteed uptime. Emoji render natively
+      in Teams TextBlocks with zero external dependency.
     """
     mapping = {
         0:  ("☀️",  "Clear sky"),
@@ -357,8 +354,7 @@ def _degrees_to_compass(degrees: float) -> str:
     Convert a wind direction in degrees to a compass point.
     WHY compass rather than degrees:
       "Wind from the SW" is immediately meaningful. "Wind from 225°"
-      requires mental conversion. Compass points are the right
-      abstraction for a morning briefing card.
+      requires mental conversion.
     """
     directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
     index = round(degrees / 45) % 8
@@ -366,7 +362,9 @@ def _degrees_to_compass(degrees: float) -> str:
 
 
 # ── Weather card builder ───────────────────────────────────────────────────────
-def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> dict:
+def _build_weather_card(
+    weather: dict, now_london: datetime, tz_label: str
+) -> dict:
     today    = weather["today"]
     forecast = weather["forecast"]
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
@@ -385,14 +383,14 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                     "horizontalAlignment": "Center",
                     "weight": "Bolder",
                     "size": "Small",
-                    "spacing": "None"
+                    "spacing": "None",
                 },
                 {
                     "type": "TextBlock",
                     "text": day["emoji"],
                     "horizontalAlignment": "Center",
                     "size": "Large",
-                    "spacing": "None"
+                    "spacing": "None",
                 },
                 {
                     "type": "TextBlock",
@@ -400,7 +398,7 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                     "horizontalAlignment": "Center",
                     "weight": "Bolder",
                     "size": "Small",
-                    "spacing": "None"
+                    "spacing": "None",
                 },
                 {
                     "type": "TextBlock",
@@ -408,9 +406,9 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                     "horizontalAlignment": "Center",
                     "isSubtle": True,
                     "size": "Small",
-                    "spacing": "None"
+                    "spacing": "None",
                 },
-            ]
+            ],
         })
 
     return {
@@ -428,14 +426,14 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                         "text": "🌦️ WEATHER — BASINGSTOKE",
                         "weight": "Bolder",
                         "color": "Warning",
-                        "spacing": "None"
+                        "spacing": "None",
                     },
                     {
                         "type": "TextBlock",
                         "text": date_str,
                         "isSubtle": True,
                         "size": "Small",
-                        "spacing": "None"
+                        "spacing": "None",
                     },
                     {
                         "type": "ColumnSet",
@@ -450,9 +448,9 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                                         "type": "TextBlock",
                                         "text": today["emoji"],
                                         "size": "ExtraLarge",
-                                        "spacing": "None"
+                                        "spacing": "None",
                                     }
-                                ]
+                                ],
                             },
                             {
                                 "type": "Column",
@@ -464,43 +462,46 @@ def _build_weather_card(weather: dict, now_london: datetime, tz_label: str) -> d
                                         "text": today["desc"],
                                         "weight": "Bolder",
                                         "size": "Large",
-                                        "spacing": "None"
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": f"{today['high']}°C / {today['low']}°C",
-                                        "size": "Medium",
-                                        "spacing": "None"
+                                        "spacing": "None",
                                     },
                                     {
                                         "type": "TextBlock",
                                         "text": (
-                                            f"🌂 {today['rain_pct']}% chance of rain   "
-                                            f"💨 {today['wind_kmh']} km/h {today['wind_dir']}"
+                                            f"{today['high']}°C / {today['low']}°C"
+                                        ),
+                                        "size": "Medium",
+                                        "spacing": "None",
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": (
+                                            f"🌂 {today['rain_pct']}% chance of rain"
+                                            f"   💨 {today['wind_kmh']} km/h"
+                                            f" {today['wind_dir']}"
                                         ),
                                         "isSubtle": True,
                                         "size": "Small",
                                         "wrap": True,
-                                        "spacing": "None"
-                                    }
-                                ]
-                            }
-                        ]
+                                        "spacing": "None",
+                                    },
+                                ],
+                            },
+                        ],
                     },
                     {
                         "type": "TextBlock",
                         "text": "─────────────────────",
                         "color": "Warning",
-                        "spacing": "Small"
+                        "spacing": "Small",
                     },
                     {
                         "type": "ColumnSet",
                         "spacing": "Small",
-                        "columns": forecast_columns
-                    }
-                ]
+                        "columns": forecast_columns,
+                    },
+                ],
             }
-        ]
+        ],
     }
 
 
@@ -510,22 +511,32 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     Fetch today's calendar events from Microsoft Graph.
     WHY calendarView rather than /events with a filter:
       calendarView automatically expands recurring events into individual
-      instances. A filter on /events would only return the series master
-      and miss individual occurrences.
+      instances. A filter on /events would only return the series master.
     WHY today midnight to midnight in London time:
       We want events for the calendar day as Phillip experiences it.
     WHY strftime rather than isoformat:
       isoformat() on a timezone-aware datetime produces +00:00 or +01:00
       suffixes which Graph's calendarView endpoint rejects with a 400.
       strftime produces a clean naive datetime string that Graph accepts.
+    WHY filter yesterday's all-day events after fetching:
+      Graph's calendarView startDateTime is inclusive. An all-day event
+      from yesterday has end = today at 00:00:00, which is exactly our
+      startDateTime — so Graph returns it. We filter it out in Python by
+      checking whether the all-day event's end date string starts with
+      today's date. Yesterday's event ends on today's date; today's
+      all-day event ends on tomorrow's date. This is safe: multi-day
+      events that span into today have an end date after today and are
+      correctly retained.
     """
     london_now = now_utc.astimezone(LONDON_TZ)
     day_start  = london_now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end    = day_start + timedelta(days=1)
     start_str  = day_start.strftime("%Y-%m-%dT%H:%M:%S")
     end_str    = day_end.strftime("%Y-%m-%dT%H:%M:%S")
+
     url = (
-        f"https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711"
+        f"https://graph.microsoft.com/v1.0/users/"
+        f"cda66539-6f2a-4a27-a5a3-a493061f8711"
         f"/calendarView"
         f"?startDateTime={start_str}&endDateTime={end_str}"
         "&$select=subject,start,end,location,isAllDay,organizer"
@@ -538,15 +549,35 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
         timeout=15,
     )
     resp.raise_for_status()
-    data = resp.json()
+    data   = resp.json()
     events = data.get("value", [])
+
     if data.get("@odata.nextLink"):
         logging.warning("emailDigest: more than 20 events today — some omitted")
-    return events
+
+    # Filter out all-day events that belong to yesterday.
+    # Yesterday's all-day event: end.dateTime starts with today's date string.
+    # Today's all-day event:     end.dateTime starts with tomorrow's date string.
+    today_date_str = day_start.strftime("%Y-%m-%d")
+    filtered = []
+    for event in events:
+        if event.get("isAllDay"):
+            end_dt_str = event.get("end", {}).get("dateTime", "")
+            if end_dt_str.startswith(today_date_str):
+                logging.info(
+                    f"emailDigest: skipping yesterday's all-day event "
+                    f"'{event.get('subject', '')}'"
+                )
+                continue
+        filtered.append(event)
+
+    return filtered
 
 
 # ── Agenda card builder ────────────────────────────────────────────────────────
-def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) -> dict:
+def _build_agenda_card(
+    events: list[dict], now_london: datetime, tz_label: str
+) -> dict:
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
     if not events:
@@ -556,7 +587,7 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                 "text": "No meetings today — enjoy the space.",
                 "isSubtle": True,
                 "wrap": True,
-                "spacing": "Small"
+                "spacing": "Small",
             }
         ]
     else:
@@ -569,15 +600,19 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                     start_dt = datetime.fromisoformat(
                         event["start"]["dateTime"]
                     ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
-                    end_dt   = datetime.fromisoformat(
+                    end_dt = datetime.fromisoformat(
                         event["end"]["dateTime"]
                     ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
-                    time_str = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+                    time_str = (
+                        f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+                    )
                 except Exception:
                     time_str = ""
 
             subject  = (event.get("subject") or "No title").strip()
-            location = (event.get("location", {}).get("displayName", "") or "").strip()
+            location = (
+                event.get("location", {}).get("displayName", "") or ""
+            ).strip()
 
             organiser_email = (
                 event.get("organizer", {})
@@ -612,22 +647,23 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                                 "size": "Small",
                                 "color": "Warning",
                                 "horizontalAlignment": "Right",
-                                "spacing": "None"
+                                "spacing": "None",
                             }
-                        ]
+                        ],
                     },
                     {
                         "type": "Column",
                         "width": "stretch",
                         "spacing": "Small",
                         "items": [
-                            item for item in [
+                            item
+                            for item in [
                                 {
                                     "type": "TextBlock",
                                     "text": subject,
                                     "weight": "Bolder",
                                     "wrap": True,
-                                    "spacing": "None"
+                                    "spacing": "None",
                                 },
                                 {
                                     "type": "TextBlock",
@@ -635,20 +671,24 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                                     "isSubtle": True,
                                     "size": "Small",
                                     "wrap": True,
-                                    "spacing": "None"
-                                } if location else None,
+                                    "spacing": "None",
+                                }
+                                if location
+                                else None,
                                 {
                                     "type": "TextBlock",
                                     "text": f"👤 {organiser_name}",
                                     "isSubtle": True,
                                     "size": "Small",
-                                    "spacing": "None"
-                                } if show_organiser else None,
+                                    "spacing": "None",
+                                }
+                                if show_organiser
+                                else None,
                             ]
                             if item is not None
-                        ]
-                    }
-                ]
+                        ],
+                    },
+                ],
             })
 
     return {
@@ -666,25 +706,25 @@ def _build_agenda_card(events: list[dict], now_london: datetime, tz_label: str) 
                         "text": "📅 TODAY'S AGENDA",
                         "weight": "Bolder",
                         "color": "Warning",
-                        "spacing": "None"
+                        "spacing": "None",
                     },
                     {
                         "type": "TextBlock",
                         "text": date_str,
                         "isSubtle": True,
                         "size": "Small",
-                        "spacing": "None"
+                        "spacing": "None",
                     },
                     {
                         "type": "TextBlock",
                         "text": "─────────────────────",
                         "color": "Warning",
-                        "spacing": "Small"
+                        "spacing": "Small",
                     },
-                    *event_items
-                ]
+                    *event_items,
+                ],
             }
-        ]
+        ],
     }
 
 
@@ -694,19 +734,23 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     Fetch emails from the Inbox received after `since`.
     WHY $filter on receivedDateTime: Graph filters server-side, keeping payload small.
     WHY top=100: a 2-hour window on a busy inbox might exceed the default 50-item limit.
-    WHY $orderby=receivedDateTime desc: list is reversed after fetching so cards stack
-      oldest-at-top — the natural chronological triage order.
+    WHY $orderby=receivedDateTime desc: list is reversed after fetching so the
+      concertina card stacks oldest-at-top — the natural chronological triage order.
+    WHY fallback to 2 hours when since is None:
+      If last_run has never been written (e.g. first ever run, or blob was lost),
+      defaulting to 2 hours prevents a flood of historical mail on first use.
     """
     headers = {"Authorization": f"Bearer {token}"}
     if since:
         since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
         two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=2)
-        since_str = two_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
+        since_str     = two_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     filter_clause = f"receivedDateTime ge {since_str}"
     url = (
-        "https://graph.microsoft.com/v1.0/users/cda66539-6f2a-4a27-a5a3-a493061f8711"
+        "https://graph.microsoft.com/v1.0/users/"
+        "cda66539-6f2a-4a27-a5a3-a493061f8711"
         "/mailFolders/Inbox/messages"
         f"?$filter={filter_clause}"
         "&$top=100"
@@ -715,7 +759,7 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     )
     resp = requests.get(url, headers=headers, timeout=15)
     resp.raise_for_status()
-    data = resp.json()
+    data   = resp.json()
     emails = data.get("value", [])
     if data.get("@odata.nextLink"):
         logging.warning("emailDigest: more than 100 emails in window — some omitted")
@@ -727,12 +771,16 @@ def _get_sender_photo(token: str, sender_email: str) -> str:
     """
     Resolve a sender's profile photo to a base64 data URI.
     Resolution order: internal M365 user photo → saved contact photo → envelope fallback.
+    WHY base64 data URI:
+      Adaptive Cards in Teams do not reliably render Graph-authenticated
+      image URLs. Embedding as base64 removes the auth dependency entirely.
     """
     headers = {"Authorization": f"Bearer {token}"}
     try:
         resp = requests.get(
             f"https://graph.microsoft.com/v1.0/users/{sender_email}/photo/$value",
-            headers=headers, timeout=10,
+            headers=headers,
+            timeout=10,
         )
         if resp.status_code == 200:
             encoded = base64.b64encode(resp.content).decode("utf-8")
@@ -752,8 +800,10 @@ def _get_sender_photo(token: str, sender_email: str) -> str:
             if contacts:
                 contact_id = contacts[0]["id"]
                 photo_resp = requests.get(
-                    f"https://graph.microsoft.com/v1.0/me/contacts/{contact_id}/photo/$value",
-                    headers=headers, timeout=10,
+                    f"https://graph.microsoft.com/v1.0/me/contacts/"
+                    f"{contact_id}/photo/$value",
+                    headers=headers,
+                    timeout=10,
                 )
                 if photo_resp.status_code == 200:
                     encoded = base64.b64encode(photo_resp.content).decode("utf-8")
@@ -811,25 +861,30 @@ def _greeting(now_london: datetime) -> str:
         return "Good evening, Phillip"
 
 
-# ── Header card builder ────────────────────────────────────────────────────────
-def _build_header_card(
-    now_london:   datetime,
-    tz_label:     str,
-    last_run_utc: datetime | None,
-    email_count:  int,
+# ── Greeting card builder ──────────────────────────────────────────────────────
+def _build_greeting_card(
+    now_london: datetime, tz_label: str, email_count: int
 ) -> dict:
+    """
+    Build the opening greeting card — always the first message Leo delivers.
+    WHY greeting first:
+      A chief of staff greets the principal before delivering any briefing.
+      Including the email count here means Phillip knows his workload
+      before reading weather or agenda.
+    WHY Adaptive Card rather than plain text:
+      The card format gives us colour and size control — the large amber
+      greeting is visually distinct and immediately readable in the channel.
+    """
     greeting_text = _greeting(now_london)
-    date_str      = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
 
-    if last_run_utc:
-        from_london = last_run_utc.astimezone(LONDON_TZ)
-        from_str    = from_london.strftime(f"%H:%M {tz_label}")
+    if email_count == 0:
+        triage_text = "Your inbox is clear — nothing to triage in this moment."
+    elif email_count == 1:
+        triage_text = "We have 1 email for you to triage in this moment."
     else:
-        from_str = "start of day"
-
-    to_str     = now_london.strftime(f"%H:%M {tz_label}")
-    window_str = f"Covering emails from {from_str} to {to_str}"
-    count_str  = "1 email to triage" if email_count == 1 else f"{email_count} emails to triage"
+        triage_text = (
+            f"We have {email_count} emails for you to triage in this moment."
+        )
 
     return {
         "type": "AdaptiveCard",
@@ -845,219 +900,362 @@ def _build_header_card(
                         "type": "TextBlock",
                         "text": greeting_text,
                         "weight": "Bolder",
-                        "size": "Large",
+                        "size": "ExtraLarge",
                         "color": "Warning",
-                        "spacing": "None"
+                        "spacing": "None",
                     },
                     {
                         "type": "TextBlock",
-                        "text": date_str,
-                        "isSubtle": True,
-                        "size": "Small",
-                        "spacing": "Small"
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": "─────────────────────",
-                        "color": "Warning",
-                        "spacing": "Small"
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": window_str,
+                        "text": triage_text,
+                        "size": "Medium",
                         "wrap": True,
-                        "spacing": "Small"
+                        "spacing": "Small",
                     },
-                    {
-                        "type": "TextBlock",
-                        "text": count_str,
-                        "weight": "Bolder",
-                        "spacing": "Small"
-                    }
-                ]
+                ],
             }
-        ]
+        ],
     }
 
 
-# ── Email card builder ─────────────────────────────────────────────────────────
-def _build_card(email: dict, tz_label: str, token: str) -> dict:
-    sender_name  = email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
-    sender_email = email.get("from", {}).get("emailAddress", {}).get("address", "")
-    subject      = (email.get("subject", "") or "(no subject)").strip()
-    body_preview = (email.get("bodyPreview", "") or "").strip()
-    email_id     = email.get("id", "")
+# ── Concertina email card builder ──────────────────────────────────────────────
+def _build_concertina_card(
+    emails: list[dict],
+    tz_label: str,
+    token: str,
+    now_london: datetime,
+) -> dict:
+    """
+    Build a single Adaptive Card containing all emails as collapsible rows.
+    WHY concertina rather than one card per email:
+      The previous pattern sent one card per email, meaning Teams anchored
+      to the last card and Phillip had to scroll up through every email
+      before triaging — processing each one twice. A single card with all
+      emails collapsed means the full inbox is visible at a glance. Phillip
+      expands only the email he is triaging at that moment.
+    WHY Action.ToggleVisibility:
+      This is the native Adaptive Card mechanism for show/hide without
+      requiring a round-trip to a backend. The toggle fires client-side
+      in Teams — instant response, no Bot Framework call needed.
+    WHY unique IDs per email (email_detail_0, email_detail_1 …):
+      Action.ToggleVisibility targets elements by their id. Each detail
+      section needs a unique id so toggling one row does not affect others.
+    WHY photos in the expanded detail only:
+      Showing photos in the collapsed summary row would make it much taller
+      and defeat the purpose of the compact view. Photos appear only when
+      an email is expanded, where there is space for them.
+    """
+    date_str = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
 
-    if len(body_preview) > 150:
-        body_preview = body_preview[:147] + "…"
+    # Card header
+    body: list[dict] = [
+        {
+            "type": "Container",
+            "style": "emphasis",
+            "bleed": True,
+            "items": [
+                {
+                    "type": "TextBlock",
+                    "text": "📧 EMAIL TRIAGE",
+                    "weight": "Bolder",
+                    "color": "Warning",
+                    "spacing": "None",
+                },
+                {
+                    "type": "TextBlock",
+                    "text": date_str,
+                    "isSubtle": True,
+                    "size": "Small",
+                    "spacing": "None",
+                },
+            ],
+        }
+    ]
 
-    received_str = email.get("receivedDateTime", "")
-    try:
-        received_utc    = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
-        received_london = received_utc.astimezone(LONDON_TZ)
-        time_label      = received_london.strftime("%H:%M")
-    except Exception:
-        time_label = ""
+    for i, email in enumerate(emails):
+        sender_name  = (
+            email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
+        )
+        sender_addr  = (
+            email.get("from", {}).get("emailAddress", {}).get("address", "")
+        )
+        subject      = (email.get("subject", "") or "(no subject)").strip()
+        body_preview = (email.get("bodyPreview", "") or "").strip()
+        email_id     = email.get("id", "")
 
-    photo_uri = _get_sender_photo(token, sender_email) if sender_email else ENVELOPE_ICON
+        if len(body_preview) > 200:
+            body_preview = body_preview[:197] + "…"
+
+        received_str = email.get("receivedDateTime", "")
+        try:
+            received_utc    = datetime.fromisoformat(
+                received_str.replace("Z", "+00:00")
+            )
+            received_london = received_utc.astimezone(LONDON_TZ)
+            time_label      = received_london.strftime("%H:%M")
+        except Exception:
+            time_label = ""
+
+        detail_id = f"email_detail_{i}"
+
+        # Resolve sender photo (shown in expanded detail only)
+        photo_uri = (
+            _get_sender_photo(token, sender_addr) if sender_addr else ENVELOPE_ICON
+        )
+
+        # Separator between emails (not before the first one)
+        if i > 0:
+            body.append({
+                "type": "TextBlock",
+                "text": "─────────────────────",
+                "color": "Warning",
+                "spacing": "None",
+                "size": "Small",
+            })
+
+        # ── Collapsed summary row (always visible) ────────────────────────────
+        # WHY selectAction on the Container:
+        #   Tapping anywhere on the summary row toggles the detail section.
+        #   This gives a large tap target, which is important on mobile.
+        body.append({
+            "type": "Container",
+            "spacing": "Small",
+            "selectAction": {
+                "type": "Action.ToggleVisibility",
+                "targetElements": [detail_id],
+            },
+            "items": [
+                {
+                    "type": "ColumnSet",
+                    "spacing": "None",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "TextBlock",
+                                    "text": sender_name,
+                                    "weight": "Bolder",
+                                    "size": "Small",
+                                    "spacing": "None",
+                                    "wrap": False,
+                                },
+                                {
+                                    "type": "TextBlock",
+                                    "text": subject,
+                                    "isSubtle": True,
+                                    "size": "Small",
+                                    "spacing": "None",
+                                    "wrap": False,
+                                },
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "auto",
+                            "verticalContentAlignment": "Center",
+                            "items": [
+                                {
+                                    "type": "TextBlock",
+                                    "text": time_label,
+                                    "isSubtle": True,
+                                    "size": "Small",
+                                    "horizontalAlignment": "Right",
+                                    "spacing": "None",
+                                },
+                                {
+                                    "type": "TextBlock",
+                                    "text": "▼",
+                                    "isSubtle": True,
+                                    "size": "Small",
+                                    "horizontalAlignment": "Right",
+                                    "spacing": "None",
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+        })
+
+        # ── Expanded detail section (hidden until tapped) ─────────────────────
+        # WHY isVisible: False:
+        #   The detail starts collapsed. Action.ToggleVisibility flips this
+        #   client-side in Teams when the summary row is tapped.
+        body.append({
+            "type": "Container",
+            "id": detail_id,
+            "isVisible": False,
+            "spacing": "Small",
+            "items": [
+                # Sender photo + email address
+                {
+                    "type": "ColumnSet",
+                    "spacing": "Small",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "auto",
+                            "verticalContentAlignment": "Center",
+                            "items": [
+                                {
+                                    "type": "Image",
+                                    "url": photo_uri,
+                                    "size": "Small",
+                                    "style": "Person",
+                                    "altText": f"Photo of {sender_name}",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "verticalContentAlignment": "Center",
+                            "items": [
+                                {
+                                    "type": "TextBlock",
+                                    "text": sender_addr,
+                                    "isSubtle": True,
+                                    "size": "Small",
+                                    "wrap": True,
+                                    "spacing": "None",
+                                }
+                            ],
+                        },
+                    ],
+                },
+                # Body preview
+                {
+                    "type": "TextBlock",
+                    "text": body_preview,
+                    "isSubtle": True,
+                    "wrap": True,
+                    "maxLines": 4,
+                    "spacing": "Small",
+                },
+                # Triage buttons
+                # NOTE: Button actions (move to Done, etc.) are placeholder
+                # Submit actions for now. A dedicated session will wire these
+                # to actual Graph API calls via the taskChain function.
+                {
+                    "type": "ColumnSet",
+                    "spacing": "Small",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Container",
+                                    "style": "default",
+                                    "selectAction": {
+                                        "type": "Action.Submit",
+                                        "data": {
+                                            "triageAction": "action",
+                                            "emailId": email_id,
+                                        },
+                                    },
+                                    "items": [
+                                        {
+                                            "type": "TextBlock",
+                                            "text": "Action",
+                                            "horizontalAlignment": "Center",
+                                            "weight": "Bolder",
+                                            "size": "Small",
+                                            "spacing": "Small",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Container",
+                                    "style": "default",
+                                    "selectAction": {
+                                        "type": "Action.Submit",
+                                        "data": {
+                                            "triageAction": "waiting",
+                                            "emailId": email_id,
+                                        },
+                                    },
+                                    "items": [
+                                        {
+                                            "type": "TextBlock",
+                                            "text": "Waiting For",
+                                            "horizontalAlignment": "Center",
+                                            "weight": "Bolder",
+                                            "size": "Small",
+                                            "spacing": "Small",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Container",
+                                    "style": "default",
+                                    "selectAction": {
+                                        "type": "Action.OpenUrl",
+                                        "url": "https://outlook.office365.com/mail/",
+                                    },
+                                    "items": [
+                                        {
+                                            "type": "TextBlock",
+                                            "text": "View",
+                                            "horizontalAlignment": "Center",
+                                            "weight": "Bolder",
+                                            "size": "Small",
+                                            "spacing": "Small",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type": "Container",
+                                    "style": "default",
+                                    "selectAction": {
+                                        "type": "Action.Submit",
+                                        "data": {
+                                            "triageAction": "delete",
+                                            "emailId": email_id,
+                                        },
+                                    },
+                                    "items": [
+                                        {
+                                            "type": "TextBlock",
+                                            "text": "Delete",
+                                            "horizontalAlignment": "Center",
+                                            "weight": "Bolder",
+                                            "size": "Small",
+                                            "spacing": "Small",
+                                        }
+                                    ],
+                                }
+                            ],
+                        },
+                    ],
+                },
+            ],
+        })
 
     return {
         "type": "AdaptiveCard",
         "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
         "version": "1.5",
-        "body": [
-            {
-                "type": "Container",
-                "style": "emphasis",
-                "bleed": True,
-                "items": [
-                    {
-                        "type": "ColumnSet",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "auto",
-                                "verticalContentAlignment": "Center",
-                                "spacing": "Small",
-                                "items": [
-                                    {
-                                        "type": "Image",
-                                        "url": photo_uri,
-                                        "size": "Small",
-                                        "style": "Person",
-                                        "altText": f"Photo of {sender_name}"
-                                    }
-                                ]
-                            },
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "spacing": "Small",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": sender_name,
-                                        "weight": "Bolder",
-                                        "wrap": True,
-                                        "spacing": "None"
-                                    },
-                                    {
-                                        "type": "ColumnSet",
-                                        "spacing": "None",
-                                        "columns": [
-                                            {
-                                                "type": "Column",
-                                                "width": "stretch",
-                                                "items": [
-                                                    {
-                                                        "type": "TextBlock",
-                                                        "text": sender_email,
-                                                        "isSubtle": True,
-                                                        "size": "Small",
-                                                        "wrap": True,
-                                                        "spacing": "None"
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                "type": "Column",
-                                                "width": "auto",
-                                                "items": [
-                                                    {
-                                                        "type": "TextBlock",
-                                                        "text": time_label,
-                                                        "isSubtle": True,
-                                                        "size": "Small",
-                                                        "horizontalAlignment": "Right",
-                                                        "spacing": "None"
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": subject,
-                        "weight": "Bolder",
-                        "size": "Medium",
-                        "wrap": True,
-                        "spacing": "Small"
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": body_preview,
-                        "isSubtle": True,
-                        "wrap": True,
-                        "maxLines": 3,
-                        "spacing": "Small"
-                    },
-                    {
-                        "type": "ColumnSet",
-                        "spacing": "Medium",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "spacing": "Small",
-                                "items": [
-                                    {
-                                        "type": "Container",
-                                        "style": "default",
-                                        "spacing": "Small",
-                                        "selectAction": {
-                                            "type": "Action.Submit",
-                                            "data": {"triageAction": "action", "emailId": email_id}
-                                        },
-                                        "items": [{"type": "TextBlock", "text": "Action", "horizontalAlignment": "Center", "weight": "Bolder", "spacing": "Small"}]
-                                    },
-                                    {
-                                        "type": "Container",
-                                        "style": "default",
-                                        "spacing": "Small",
-                                        "selectAction": {
-                                            "type": "Action.Submit",
-                                            "data": {"triageAction": "waiting", "emailId": email_id}
-                                        },
-                                        "items": [{"type": "TextBlock", "text": "Waiting For", "horizontalAlignment": "Center", "weight": "Bolder", "spacing": "Small"}]
-                                    }
-                                ]
-                            },
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "spacing": "Small",
-                                "items": [
-                                    {
-                                        "type": "Container",
-                                        "style": "default",
-                                        "spacing": "Small",
-                                        "selectAction": {
-                                            "type": "Action.OpenUrl",
-                                            "url": "https://outlook.office365.com/mail/"
-                                        },
-                                        "items": [{"type": "TextBlock", "text": "View", "horizontalAlignment": "Center", "weight": "Bolder", "spacing": "Small"}]
-                                    },
-                                    {
-                                        "type": "Container",
-                                        "style": "default",
-                                        "spacing": "Small",
-                                        "selectAction": {
-                                            "type": "Action.Submit",
-                                            "data": {"triageAction": "delete", "emailId": email_id}
-                                        },
-                                        "items": [{"type": "TextBlock", "text": "Delete", "horizontalAlignment": "Center", "weight": "Bolder", "spacing": "Small"}]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
+        "body": body,
     }
 
 
@@ -1075,7 +1273,10 @@ def _send_text_to_teams(text: str) -> None:
     url = f"{service_url}/v3/conversations/{channel_id}/activities"
     resp = requests.post(
         url,
-        headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {bot_token}",
+            "Content-Type": "application/json",
+        },
         json={
             "type": "message",
             "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
@@ -1102,45 +1303,6 @@ def _send_card_to_teams(card: dict) -> None:
     }
     resp = requests.post(
         url,
-        headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    logging.info(f"emailDigest: card delivered — status {resp.status_code}")
-
-
-def _send_cards_to_teams(cards: list[dict]) -> None:
-    """
-    Post multiple Adaptive Cards as a single Bot Framework message activity.
-    WHY a single activity with multiple attachments:
-      Teams anchors the channel view to the bottom-most message. A single
-      activity with all cards in the attachments array arrives as one message —
-      Teams renders them stacked in order from the top without scrolling.
-    WHY no CARD_SEND_DELAY:
-      The delay was a rate-limit precaution for sequential POSTs.
-      With a single POST there is nothing to throttle.
-    """
-    if not cards:
-        return
-
-    bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
-    url = f"{service_url}/v3/conversations/{channel_id}/activities"
-
-    payload = {
-        "type": "message",
-        "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
-        "attachments": [
-            {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "content": card,
-            }
-            for card in cards
-        ],
-    }
-
-    resp = requests.post(
-        url,
         headers={
             "Authorization": f"Bearer {bot_token}",
             "Content-Type": "application/json",
@@ -1149,7 +1311,4 @@ def _send_cards_to_teams(cards: list[dict]) -> None:
         timeout=15,
     )
     resp.raise_for_status()
-    logging.info(
-        f"emailDigest: {len(cards)} email card(s) delivered as single message"
-        f" — status {resp.status_code}"
-    )
+    logging.info(f"emailDigest: card delivered — status {resp.status_code}")
