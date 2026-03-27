@@ -1,15 +1,15 @@
 # task_guardian.py
 #
 # Why this file exists:
-#   Azure Functions on a Consumption plan can be recycled by the platform for
-#   maintenance at any time. When this happens during a 05:00 UTC trigger window,
-#   the morning and day-of-week tasks are silently lost — the app is not running
-#   to receive the trigger, and Azure does not replay missed timer events.
+#   The morning task triggers fire at 05:00 UTC. If the host is not fully
+#   stable at that moment — for example, immediately after a restart or an
+#   infrastructure event — the triggers can be silently lost. Azure does not
+#   replay missed timer events.
 #
-#   This guardian fires at 05:15 UTC every day — fifteen minutes after the task
-#   triggers. It checks whether every expected task for today exists in To Do.
-#   If any are missing, it creates them and sends a Leo alert to the Daily
-#   Operations channel so the failure is never silent.
+#   This guardian fires at 05:15 UTC every day — fifteen minutes after the
+#   task triggers. It checks whether every expected task for today exists in
+#   To Do. If any are missing, it creates them and sends a Leo alert to the
+#   Daily Operations channel so the failure is never silent.
 #
 #   If everything is present, it logs a single clean OK line and exits.
 #   The cost of running this check daily is negligible.
@@ -22,12 +22,20 @@
 #   granted as an application permission. The Bot Framework pattern uses
 #   client credentials (BOT_APP_ID + BOT_CLIENT_SECRET) and posts directly
 #   to the channel ID — confirmed working in Session 24.
+#
+# Session 30 fix:
+#   Alert message rewritten in Leo's voice — first contact of the day,
+#   fact then action, no machinery explanation.
+#   File header updated to reflect B1 plan (no longer Consumption plan).
+
 import azure.functions as func
 import logging
 import os
 import requests
 from datetime import datetime, timezone
+
 bp = func.Blueprint()
+
 USER_ID       = "cda66539-6f2a-4a27-a5a3-a493061f8711"
 HOME_LIST_ID  = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
 ADMIN_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA="
@@ -170,9 +178,10 @@ def send_teams_alert(recovered: list[str]) -> None:
       BOT_CLIENT_SECRET) and posts directly to the channel thread ID —
       no additional permissions required beyond what is already in place.
 
-    Why the Graph token is not passed in:
-      This function uses the Bot Framework token, not the Graph token.
-      The two are obtained separately and serve different APIs.
+    Why Leo's voice:
+      This is the first message of the day when the 05:00 run has failed.
+      Leo states the fact, lists what he's recovered, and closes. No
+      explanation of infrastructure. No hedging. Fact, action, done.
 
     App settings required (already present):
       BOT_APP_ID, BOT_CLIENT_SECRET, TENANT_ID,
@@ -191,11 +200,10 @@ def send_teams_alert(recovered: list[str]) -> None:
 
     task_lines = "\n".join(f"  • {t}" for t in recovered)
     message    = (
-        f"⚠️ Guardian Alert\n\n"
-        f"The following tasks were not created at 05:00 UTC and have been recovered "
-        f"at 05:15 UTC:\n\n{task_lines}\n\n"
-        f"Cause: Azure recycled the Consumption plan instance during the 05:00 trigger "
-        f"window. Tasks are now in To Do. No action required."
+        f"Good morning, Phillip.\n\n"
+        f"The 05:00 run didn't fire. I've recovered the missing tasks:\n\n"
+        f"{task_lines}\n\n"
+        f"Everything's in To Do."
     )
 
     try:
@@ -247,6 +255,7 @@ def get_expected_tasks_today() -> list[dict]:
     weekday = now.weekday()  # Monday=0 … Sunday=6
     morning = today_utc_at(5, 0)
     tasks   = []
+
     # ── Daily morning tasks (every day, every week) ───────────────────────────
     tasks += [
         {
@@ -280,6 +289,7 @@ def get_expected_tasks_today() -> list[dict]:
             "due_utc":  morning,
         },
     ]
+
     # ── Day-of-week tasks ─────────────────────────────────────────────────────
     if weekday == 0:  # Monday
         tasks += [
@@ -363,6 +373,7 @@ def get_expected_tasks_today() -> list[dict]:
                 "category": "[00] System",
                 "due_utc":  morning,
             })
+
     return tasks
 
 
@@ -377,10 +388,11 @@ def taskGuardian(timer: func.TimerRequest) -> None:
     day-of-week triggers at 05:00. Checks every expected task for today.
     Recovers any that are missing. Alerts Leo's Daily Operations channel
     if recovery was needed. Logs a clean OK if everything was present.
-    This function is the answer to silent failure. The Consumption plan
-    can be recycled by Azure at any time. When that happens at 05:00, tasks
-    are lost without trace. This guardian ensures that loss is always detected,
-    always recovered, and always visible.
+
+    This function is the answer to silent failure. If the host is not fully
+    stable at 05:00 for any reason, tasks are lost without trace. This guardian
+    ensures that loss is always detected, always recovered, and always visible.
+
     The 15-minute gap is deliberate: it gives the 05:00 triggers enough time
     to complete before the guardian checks whether they succeeded. Firing too
     soon would cause false recoveries on days when the triggers fired correctly
@@ -390,8 +402,10 @@ def taskGuardian(timer: func.TimerRequest) -> None:
     token = get_access_token()
     if not token:
         return
+
     expected  = get_expected_tasks_today()
     recovered = []
+
     for task in expected:
         if not task_exists_today(token, task["list_id"], task["title"]):
             success = create_todo_task(
@@ -404,6 +418,7 @@ def taskGuardian(timer: func.TimerRequest) -> None:
             )
             if success:
                 recovered.append(task["title"])
+
     if recovered:
         logging.warning(
             f"taskGuardian: Recovered {len(recovered)} missing task(s): {recovered}"
