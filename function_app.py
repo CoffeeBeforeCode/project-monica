@@ -12,7 +12,7 @@ WHY this file exists:
   crashes only that Blueprint. If this file itself crashes, all functions
   go down — so it must stay simple and free of logic.
 
-Current function inventory (14 timer triggers + 3 HTTP triggers = 17 total):
+Current function inventory (12 timer triggers + 3 HTTP triggers = 15 total):
 
   File                  Function                    Type
   ─────────────────────────────────────────────────────────────────────────
@@ -30,8 +30,12 @@ Current function inventory (14 timer triggers + 3 HTTP triggers = 17 total):
   task_friday.py        createFridayTasks           Timer — Friday 05:00 UTC
   task_sunday.py        createSundayTasks           Timer — Sunday 17:00 UTC
   task_monthly.py       createMonthlyTasks          Timer — 1st of month 05:00 UTC
-  task_keepalive.py     keepAlive                   Timer — every 4 minutes
-  task_guardian.py      taskGuardian                Timer — daily 06:00 UTC
+  task_guardian.py      taskGuardian                Timer — daily 05:15 UTC
+
+  Note: task_keepalive.py removed in Session 30. keepAlive was introduced
+  to prevent the Consumption plan host going cold. The project is now on
+  the B1 Basic App Service Plan, which is always-on. keepAlive serves
+  no purpose on B1 and has been deleted.
 """
 
 import azure.functions as func
@@ -55,7 +59,6 @@ from task_thursday    import bp as bp_thursday
 from task_friday      import bp as bp_friday
 from task_sunday      import bp as bp_sunday
 from task_monthly     import bp as bp_monthly
-from task_keepalive   import bp as bp_keepalive
 from task_guardian    import bp as bp_guardian
 
 # ── App initialisation ────────────────────────────────────────────────────────
@@ -80,7 +83,6 @@ app.register_blueprint(bp_thursday)
 app.register_blueprint(bp_friday)
 app.register_blueprint(bp_sunday)
 app.register_blueprint(bp_monthly)
-app.register_blueprint(bp_keepalive)
 app.register_blueprint(bp_guardian)
 
 
