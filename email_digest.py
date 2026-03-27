@@ -45,29 +45,43 @@ Session 29 changes:
     before weather and agenda. It includes the email count so Phillip
     knows the workload before anything else is delivered.
   - Emails fetched before greeting is sent so the count is available.
-  - All-day events from the previous day are filtered out. Graph's
-    calendarView boundary is inclusive on startDateTime, which causes
-    yesterday's all-day event (ending exactly at today's midnight) to
-    appear in the agenda. A post-fetch filter removes it.
-  - Concertina email card replaces the previous one-card-per-email and
-    multi-attachment patterns. All emails are delivered as a single
-    Adaptive Card with collapsed rows. Each row shows sender, subject,
-    and received time. Tapping a row expands the body preview and triage
-    buttons via Action.ToggleVisibility.
+  - All-day events from the previous day are filtered out.
+  - Concertina email card replaces the previous one-card-per-email pattern.
   - _build_header_card, _build_card, and _send_cards_to_teams removed.
   - _build_greeting_card and _build_concertina_card added.
 
+Session 30 changes:
+  - Standalone greeting card removed entirely.
+  - First slot: single unified morning briefing card (greeting + weather
+    + agenda), followed by concertina card with email count in header.
+    Weather and agenda are only ever sent at first slot.
+  - All other slots (07:00–17:00): concertina card with slot-specific
+    Leo greeting and email count integrated into the card header.
+  - 19:00: concertina card (greeting + count) followed by tomorrow's
+    agenda card ("Here's what tomorrow looks like, Phillip.") and a
+    goodnight card ("Good night, Sir."). Leo closes the day.
+  - Leo voice greetings — fixed per slot, short declaratives, alternating
+    between Phillip and Sir. Defined in _greeting().
+  - Email count lines rewritten in Leo's voice — _email_count_line().
+  - Triage button containers styled with Adaptive Card container styles:
+    Action=accent, Waiting For=warning, View=emphasis, Delete=attention.
+  - _build_greeting_card removed. Replaced by _build_morning_briefing_card,
+    _build_clear_inbox_card, and _build_goodnight_card.
+  - _fetch_calendar_events gains a day_offset parameter (used for tomorrow).
+  - _build_agenda_card gains label and intro parameters (used for tomorrow).
+  - _build_event_items extracted as a shared helper.
+
 Slot logic:
-  First slot  (weather + agenda + digest):
+  First slot  (weather + agenda + email digest):
     Mon–Sat: 05:00 UTC
     Sun:     07:00 UTC  (05:00 is suppressed)
-  Second slot (agenda + digest only):
-    Mon–Sat: 07:00 UTC
-    Sun:     09:00 UTC
-  All other slots: email digest only
+  All other slots (email digest only):
+    07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00
+  19:00 additionally delivers tomorrow's agenda and goodnight card.
 """
 import os
 import logging
+import random
 import time
 import base64
 import requests
@@ -86,14 +100,9 @@ BLOB_NAME       = "last_run.txt"
 CARD_SEND_DELAY = 0.3
 
 # Basingstoke RG21 5NP coordinates
-# WHY hardcoded: weather is always for Phillip's home base. If location
-# ever changes it is a one-line edit. No need for dynamic lookup.
 WEATHER_LAT = 51.2654
 WEATHER_LON = -1.0872
 
-# WHY an embedded SVG rather than a hosted URL:
-#   Embedding the icon as a base64 data URI means it always renders,
-#   with zero external dependencies.
 ENVELOPE_ICON = (
     "data:image/svg+xml;base64,"
     "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAy"
@@ -127,26 +136,25 @@ def emailDigest(timer: func.TimerRequest) -> None:
     # WHY slot logic in UTC:
     #   The cron schedule is defined in UTC. Comparing against UTC hour
     #   is therefore always correct, even when London is in BST.
-    is_first_slot  = (weekday != 6 and hour == 5) or (weekday == 6 and hour == 7)
-    is_second_slot = (weekday != 6 and hour == 7) or (weekday == 6 and hour == 9)
+    is_first_slot = (weekday != 6 and hour == 5) or (weekday == 6 and hour == 7)
 
     logging.info(
         f"emailDigest: starting at {now_utc.isoformat()} UTC — "
-        f"first_slot={is_first_slot}, second_slot={is_second_slot}"
+        f"first_slot={is_first_slot}, hour={hour}"
     )
 
-    # ── Fetch Graph token (used for email, calendar, contacts, photos) ────────
+    # ── Fetch Graph token ─────────────────────────────────────────────────────
     token = get_access_token()
     if not token:
         logging.error("emailDigest: no access token — aborting")
         return
 
-    # ── Fetch emails before sending anything ─────────────────────────────────
-    # WHY fetch emails first:
-    #   The greeting card states how many emails there are. We need the
-    #   count before sending the first message. Fetching early also means
-    #   last_run is written at the start of delivery, not after — so a
-    #   crash mid-send does not cause duplicate emails on the next run.
+    # ── Fetch emails ──────────────────────────────────────────────────────────
+    # WHY fetch emails before sending anything:
+    #   The email count line appears in the concertina card header at every
+    #   slot. Fetching first means the count is always accurate when the
+    #   card is built. last_run is written immediately after fetch so a
+    #   crash mid-send does not cause duplicates on the next run.
     last_run_utc = _read_last_run()
     logging.info(
         f"emailDigest: last run was "
@@ -156,62 +164,110 @@ def emailDigest(timer: func.TimerRequest) -> None:
     logging.info(f"emailDigest: fetched {len(emails)} emails")
     _write_last_run(now_utc)
 
-    # ── Step 1: Greeting card (always first) ──────────────────────────────────
-    # WHY greeting first:
-    #   Leo greets Phillip before delivering any briefing. The greeting
-    #   includes the email count so the workload is known immediately,
-    #   before weather and agenda are read.
-    greeting_card = _build_greeting_card(now_london, tz_label, len(emails))
-    _send_card_to_teams(greeting_card)
-    time.sleep(CARD_SEND_DELAY)
-    logging.info("emailDigest: greeting card delivered")
-
-    # ── Step 2: Weather card (first slot only) ────────────────────────────────
-    # WHY weather only on first slot:
-    #   The weather card sets up the day. Repeating it every 2 hours
-    #   would be noise. Once in the morning is the right cadence.
-    if is_first_slot:
-        try:
-            weather      = _fetch_weather()
-            weather_card = _build_weather_card(weather, now_london, tz_label)
-            _send_card_to_teams(weather_card)
-            time.sleep(CARD_SEND_DELAY)
-            logging.info("emailDigest: weather card delivered")
-        except Exception as e:
-            logging.error(f"emailDigest: weather card failed — {e}")
-
-    # ── Step 3: Agenda card (first and second slot) ───────────────────────────
-    # WHY agenda on both first and second slot:
-    #   First slot gives the full day view at wake-up. Second slot is a
-    #   useful reminder before the day starts properly. After that,
-    #   repeating the agenda would be noise.
-    if is_first_slot or is_second_slot:
-        try:
-            events      = _fetch_calendar_events(token, now_utc)
-            agenda_card = _build_agenda_card(events, now_london, tz_label)
-            _send_card_to_teams(agenda_card)
-            time.sleep(CARD_SEND_DELAY)
-            logging.info(
-                f"emailDigest: agenda card delivered — {len(events)} event(s)"
-            )
-        except Exception as e:
-            logging.error(f"emailDigest: agenda card failed — {e}")
-
-    # ── Step 4: Email concertina card (all slots) ─────────────────────────────
-    if not emails:
-        # Greeting already told Phillip the inbox is clear. Nothing more to send.
-        return
-
-    # WHY reversed: Graph returns emails newest-first (receivedDateTime desc).
-    #   Reversing puts the oldest email at the top so Phillip reads
-    #   chronologically top-to-bottom — the natural triage order.
+    # Oldest first — natural chronological triage order
     emails = list(reversed(emails))
 
-    concertina_card = _build_concertina_card(emails, tz_label, token, now_london)
-    _send_card_to_teams(concertina_card)
-    logging.info(
-        f"emailDigest: concertina card delivered — {len(emails)} email(s)"
-    )
+    greeting   = _greeting(hour, is_first_slot)
+    count_line = _email_count_line(len(emails))
+
+    # ── First slot: unified morning briefing card + concertina ────────────────
+    if is_first_slot:
+        # WHY unified morning briefing card:
+        #   Previously three separate cards (greeting, weather, agenda).
+        #   A single card is cleaner — one message, one scroll position,
+        #   Leo greets and briefs the day in a single delivery.
+        # WHY email count in concertina header, not morning card:
+        #   The natural flow is: brief the day, then here are the emails.
+        #   Stating the email count before weather and agenda would mean
+        #   13 lines of weather and agenda between the count and the emails.
+        #   Putting the count at the top of the concertina card means it
+        #   sits immediately above the emails it describes.
+        weather = None
+        try:
+            weather = _fetch_weather()
+        except Exception as e:
+            logging.error(f"emailDigest: weather fetch failed — {e}")
+
+        events = []
+        try:
+            events = _fetch_calendar_events(token, now_utc)
+        except Exception as e:
+            logging.error(f"emailDigest: calendar fetch failed — {e}")
+
+        morning_card = _build_morning_briefing_card(weather, events, now_london, tz_label)
+        _send_card_to_teams(morning_card)
+        time.sleep(CARD_SEND_DELAY)
+        logging.info("emailDigest: morning briefing card delivered")
+
+        # Concertina — no greeting (already in morning card), count only
+        if emails:
+            concertina_card = _build_concertina_card(
+                emails, tz_label, token, now_london,
+                greeting=None, count_line=count_line,
+            )
+            _send_card_to_teams(concertina_card)
+            logging.info(f"emailDigest: concertina card delivered — {len(emails)} email(s)")
+        else:
+            _send_card_to_teams(_build_clear_inbox_card(greeting=None, count_line=count_line))
+            logging.info("emailDigest: inbox clear card delivered")
+
+    # ── 19:00: concertina + tomorrow's agenda + goodnight ─────────────────────
+    elif hour == 19:
+        # WHY three cards at 19:00:
+        #   Leo closes the working day in sequence — here is the inbox,
+        #   here is tomorrow, good night. The order matters: inbox is
+        #   the last work action; the look-ahead is the transition;
+        #   goodnight is the close. Reversing the order would feel wrong.
+        if emails:
+            concertina_card = _build_concertina_card(
+                emails, tz_label, token, now_london,
+                greeting=greeting, count_line=count_line,
+            )
+            _send_card_to_teams(concertina_card)
+            logging.info(f"emailDigest: concertina card delivered — {len(emails)} email(s)")
+        else:
+            _send_card_to_teams(_build_clear_inbox_card(greeting=greeting, count_line=count_line))
+            logging.info("emailDigest: inbox clear card delivered")
+        time.sleep(CARD_SEND_DELAY)
+
+        try:
+            tomorrow_events = _fetch_calendar_events(token, now_utc, day_offset=1)
+            # WHY now_london + 1 day:
+            #   _build_agenda_card uses the passed datetime for the date
+            #   label. Passing today's datetime would show today's date
+            #   on tomorrow's agenda card.
+            tomorrow_london = now_london + timedelta(days=1)
+            tomorrow_card   = _build_agenda_card(
+                tomorrow_events,
+                tomorrow_london,
+                tz_label,
+                label="TOMORROW'S AGENDA",
+                intro="Here's what tomorrow looks like, Phillip.",
+            )
+            _send_card_to_teams(tomorrow_card)
+            time.sleep(CARD_SEND_DELAY)
+            logging.info(
+                f"emailDigest: tomorrow agenda card delivered — "
+                f"{len(tomorrow_events)} event(s)"
+            )
+        except Exception as e:
+            logging.error(f"emailDigest: tomorrow agenda card failed — {e}")
+
+        _send_card_to_teams(_build_goodnight_card())
+        logging.info("emailDigest: goodnight card delivered")
+
+    # ── All other slots: concertina with greeting in header ───────────────────
+    else:
+        if emails:
+            concertina_card = _build_concertina_card(
+                emails, tz_label, token, now_london,
+                greeting=greeting, count_line=count_line,
+            )
+            _send_card_to_teams(concertina_card)
+            logging.info(f"emailDigest: concertina card delivered — {len(emails)} email(s)")
+        else:
+            _send_card_to_teams(_build_clear_inbox_card(greeting=greeting, count_line=count_line))
+            logging.info("emailDigest: inbox clear card delivered")
 
 
 # ── Authentication ─────────────────────────────────────────────────────────────
@@ -271,15 +327,11 @@ def _fetch_weather() -> dict:
     """
     Fetch a 5-day forecast from Open-Meteo for Basingstoke RG21 5NP.
     WHY Open-Meteo:
-      Free with no API key required — no Key Vault secret needed, no
+      Free with no API key required. No Key Vault secret needed, no
       rate limit concerns at Monica's usage volume. Excellent UK coverage.
-      Temperatures are returned in Celsius natively.
     WHY daily rather than hourly:
       The morning card gives a day-level overview. Hourly data is more
       detail than is useful at 05:00.
-    Returns a dict with keys:
-      today: {description, emoji, high, low, rain_pct, wind_kmh, wind_dir}
-      forecast: list of 4 dicts [{day_name, emoji, high, low}]
     """
     url = (
         "https://api.open-meteo.com/v1/forecast"
@@ -295,7 +347,7 @@ def _fetch_weather() -> dict:
     data = resp.json()["daily"]
 
     def parse_day(i: int) -> dict:
-        code       = data["weathercode"][i]
+        code        = data["weathercode"][i]
         emoji, desc = _wmo_to_label(code)
         return {
             "date":     data["time"][i],
@@ -308,15 +360,13 @@ def _fetch_weather() -> dict:
             "wind_dir": _degrees_to_compass(data["winddirection_10m_dominant"][i]),
         }
 
-    today    = parse_day(0)
-    forecast = [parse_day(i) for i in range(1, 5)]
-    return {"today": today, "forecast": forecast}
+    return {"today": parse_day(0), "forecast": [parse_day(i) for i in range(1, 5)]}
 
 
 def _wmo_to_label(code: int) -> tuple[str, str]:
     """
     Map a WMO weather interpretation code to an emoji and short description.
-    WHY emoji in TextBlocks rather than weather icon images:
+    WHY emoji rather than weather icon images:
       External image URLs have no guaranteed uptime. Emoji render natively
       in Teams TextBlocks with zero external dependency.
     """
@@ -353,183 +403,39 @@ def _degrees_to_compass(degrees: float) -> str:
     """
     Convert a wind direction in degrees to a compass point.
     WHY compass rather than degrees:
-      "Wind from the SW" is immediately meaningful. "Wind from 225°"
-      requires mental conversion.
+      "Wind from the SW" is immediately meaningful. "225°" requires
+      mental conversion.
     """
     directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-    index = round(degrees / 45) % 8
-    return directions[index]
-
-
-# ── Weather card builder ───────────────────────────────────────────────────────
-def _build_weather_card(
-    weather: dict, now_london: datetime, tz_label: str
-) -> dict:
-    today    = weather["today"]
-    forecast = weather["forecast"]
-    date_str = now_london.strftime(f"%A %d %B — {tz_label}")
-
-    forecast_columns = []
-    for day in forecast:
-        dt       = datetime.strptime(day["date"], "%Y-%m-%d")
-        day_name = dt.strftime("%a")
-        forecast_columns.append({
-            "type": "Column",
-            "width": "stretch",
-            "items": [
-                {
-                    "type": "TextBlock",
-                    "text": day_name,
-                    "horizontalAlignment": "Center",
-                    "weight": "Bolder",
-                    "size": "Small",
-                    "spacing": "None",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": day["emoji"],
-                    "horizontalAlignment": "Center",
-                    "size": "Large",
-                    "spacing": "None",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": f"{day['high']}°",
-                    "horizontalAlignment": "Center",
-                    "weight": "Bolder",
-                    "size": "Small",
-                    "spacing": "None",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": f"{day['low']}°",
-                    "horizontalAlignment": "Center",
-                    "isSubtle": True,
-                    "size": "Small",
-                    "spacing": "None",
-                },
-            ],
-        })
-
-    return {
-        "type": "AdaptiveCard",
-        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
-        "version": "1.5",
-        "body": [
-            {
-                "type": "Container",
-                "style": "emphasis",
-                "bleed": True,
-                "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "🌦️ WEATHER — BASINGSTOKE",
-                        "weight": "Bolder",
-                        "color": "Warning",
-                        "spacing": "None",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": date_str,
-                        "isSubtle": True,
-                        "size": "Small",
-                        "spacing": "None",
-                    },
-                    {
-                        "type": "ColumnSet",
-                        "spacing": "Medium",
-                        "columns": [
-                            {
-                                "type": "Column",
-                                "width": "auto",
-                                "verticalContentAlignment": "Center",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": today["emoji"],
-                                        "size": "ExtraLarge",
-                                        "spacing": "None",
-                                    }
-                                ],
-                            },
-                            {
-                                "type": "Column",
-                                "width": "stretch",
-                                "spacing": "Small",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": today["desc"],
-                                        "weight": "Bolder",
-                                        "size": "Large",
-                                        "spacing": "None",
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": (
-                                            f"{today['high']}°C / {today['low']}°C"
-                                        ),
-                                        "size": "Medium",
-                                        "spacing": "None",
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": (
-                                            f"🌂 {today['rain_pct']}% chance of rain"
-                                            f"   💨 {today['wind_kmh']} km/h"
-                                            f" {today['wind_dir']}"
-                                        ),
-                                        "isSubtle": True,
-                                        "size": "Small",
-                                        "wrap": True,
-                                        "spacing": "None",
-                                    },
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": "─────────────────────",
-                        "color": "Warning",
-                        "spacing": "Small",
-                    },
-                    {
-                        "type": "ColumnSet",
-                        "spacing": "Small",
-                        "columns": forecast_columns,
-                    },
-                ],
-            }
-        ],
-    }
+    return directions[round(degrees / 45) % 8]
 
 
 # ── Calendar fetching ──────────────────────────────────────────────────────────
-def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
+def _fetch_calendar_events(
+    token: str, now_utc: datetime, day_offset: int = 0
+) -> list[dict]:
     """
-    Fetch today's calendar events from Microsoft Graph.
+    Fetch calendar events for a given day from Microsoft Graph.
+    WHY day_offset:
+      day_offset=0 (default) returns today's events.
+      day_offset=1 returns tomorrow's — used by the 19:00 closing card.
+      A single function handles both cases to avoid duplication.
     WHY calendarView rather than /events with a filter:
       calendarView automatically expands recurring events into individual
       instances. A filter on /events would only return the series master.
-    WHY today midnight to midnight in London time:
-      We want events for the calendar day as Phillip experiences it.
-    WHY strftime rather than isoformat:
-      isoformat() on a timezone-aware datetime produces +00:00 or +01:00
-      suffixes which Graph's calendarView endpoint rejects with a 400.
-      strftime produces a clean naive datetime string that Graph accepts.
     WHY filter yesterday's all-day events after fetching:
       Graph's calendarView startDateTime is inclusive. An all-day event
-      from yesterday has end = today at 00:00:00, which is exactly our
-      startDateTime — so Graph returns it. We filter it out in Python by
-      checking whether the all-day event's end date string starts with
-      today's date. Yesterday's event ends on today's date; today's
-      all-day event ends on tomorrow's date. This is safe: multi-day
-      events that span into today have an end date after today and are
-      correctly retained.
+      from the previous day ends exactly at the query start — so Graph
+      returns it. We filter in Python: if the event is all-day and its
+      end date matches our day_start date, it belongs to the day before.
+      Multi-day events that span into the target day have an end date
+      after day_start and are correctly retained.
     """
     london_now = now_utc.astimezone(LONDON_TZ)
-    day_start  = london_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start  = (
+        london_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        + timedelta(days=day_offset)
+    )
     day_end    = day_start + timedelta(days=1)
     start_str  = day_start.strftime("%Y-%m-%dT%H:%M:%S")
     end_str    = day_end.strftime("%Y-%m-%dT%H:%M:%S")
@@ -553,11 +459,8 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     events = data.get("value", [])
 
     if data.get("@odata.nextLink"):
-        logging.warning("emailDigest: more than 20 events today — some omitted")
+        logging.warning("emailDigest: more than 20 events — some omitted")
 
-    # Filter out all-day events that belong to yesterday.
-    # Yesterday's all-day event: end.dateTime starts with today's date string.
-    # Today's all-day event:     end.dateTime starts with tomorrow's date string.
     today_date_str = day_start.strftime("%Y-%m-%d")
     filtered = []
     for event in events:
@@ -565,7 +468,7 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
             end_dt_str = event.get("end", {}).get("dateTime", "")
             if end_dt_str.startswith(today_date_str):
                 logging.info(
-                    f"emailDigest: skipping yesterday's all-day event "
+                    f"emailDigest: skipping previous day's all-day event "
                     f"'{event.get('subject', '')}'"
                 )
                 continue
@@ -574,14 +477,17 @@ def _fetch_calendar_events(token: str, now_utc: datetime) -> list[dict]:
     return filtered
 
 
-# ── Agenda card builder ────────────────────────────────────────────────────────
-def _build_agenda_card(
-    events: list[dict], now_london: datetime, tz_label: str
-) -> dict:
-    date_str = now_london.strftime(f"%A %d %B — {tz_label}")
-
+# ── Event items helper ─────────────────────────────────────────────────────────
+def _build_event_items(events: list[dict]) -> list[dict]:
+    """
+    Build the Adaptive Card body items for a list of calendar events.
+    WHY extracted as a helper:
+      Both _build_morning_briefing_card and _build_agenda_card need to
+      render calendar events. Extracting the logic here means one source
+      of truth — a change to event formatting applies everywhere.
+    """
     if not events:
-        event_items = [
+        return [
             {
                 "type": "TextBlock",
                 "text": "No meetings today — enjoy the space.",
@@ -590,106 +496,152 @@ def _build_agenda_card(
                 "spacing": "Small",
             }
         ]
-    else:
-        event_items = []
-        for i, event in enumerate(events):
-            if event.get("isAllDay"):
-                time_str = "All day"
-            else:
-                try:
-                    start_dt = datetime.fromisoformat(
-                        event["start"]["dateTime"]
-                    ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
-                    end_dt = datetime.fromisoformat(
-                        event["end"]["dateTime"]
-                    ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
-                    time_str = (
-                        f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
-                    )
-                except Exception:
-                    time_str = ""
 
-            subject  = (event.get("subject") or "No title").strip()
-            location = (
-                event.get("location", {}).get("displayName", "") or ""
-            ).strip()
+    items = []
+    for i, event in enumerate(events):
+        if event.get("isAllDay"):
+            time_str = "All day"
+        else:
+            try:
+                start_dt = datetime.fromisoformat(
+                    event["start"]["dateTime"]
+                ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
+                end_dt = datetime.fromisoformat(
+                    event["end"]["dateTime"]
+                ).replace(tzinfo=timezone.utc).astimezone(LONDON_TZ)
+                time_str = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
+            except Exception:
+                time_str = ""
 
-            organiser_email = (
-                event.get("organizer", {})
-                     .get("emailAddress", {})
-                     .get("address", "")
-            ).lower()
-            show_organiser = (
-                organiser_email
-                and "cda66539" not in organiser_email
-                and "phillip" not in organiser_email
-            )
-            organiser_name = (
-                event.get("organizer", {})
-                     .get("emailAddress", {})
-                     .get("name", "")
-            )
+        subject  = (event.get("subject") or "No title").strip()
+        location = (event.get("location", {}).get("displayName", "") or "").strip()
 
-            spacing = "Small" if i == 0 else "Medium"
+        organiser_email = (
+            event.get("organizer", {})
+                 .get("emailAddress", {})
+                 .get("address", "")
+        ).lower()
+        show_organiser = (
+            organiser_email
+            and "cda66539" not in organiser_email
+            and "phillip" not in organiser_email
+        )
+        organiser_name = (
+            event.get("organizer", {})
+                 .get("emailAddress", {})
+                 .get("name", "")
+        )
 
-            event_items.append({
-                "type": "ColumnSet",
-                "spacing": spacing,
-                "columns": [
-                    {
-                        "type": "Column",
-                        "width": "auto",
-                        "items": [
+        items.append({
+            "type": "ColumnSet",
+            "spacing": "Small" if i == 0 else "Medium",
+            "columns": [
+                {
+                    "type": "Column",
+                    "width": "auto",
+                    "items": [
+                        {
+                            "type": "TextBlock",
+                            "text": time_str,
+                            "weight": "Bolder",
+                            "size": "Small",
+                            "color": "Warning",
+                            "horizontalAlignment": "Right",
+                            "spacing": "None",
+                        }
+                    ],
+                },
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "spacing": "Small",
+                    "items": [
+                        item for item in [
                             {
                                 "type": "TextBlock",
-                                "text": time_str,
+                                "text": subject,
                                 "weight": "Bolder",
-                                "size": "Small",
-                                "color": "Warning",
-                                "horizontalAlignment": "Right",
+                                "wrap": True,
                                 "spacing": "None",
-                            }
-                        ],
-                    },
-                    {
-                        "type": "Column",
-                        "width": "stretch",
-                        "spacing": "Small",
-                        "items": [
-                            item
-                            for item in [
-                                {
-                                    "type": "TextBlock",
-                                    "text": subject,
-                                    "weight": "Bolder",
-                                    "wrap": True,
-                                    "spacing": "None",
-                                },
-                                {
-                                    "type": "TextBlock",
-                                    "text": f"📍 {location}",
-                                    "isSubtle": True,
-                                    "size": "Small",
-                                    "wrap": True,
-                                    "spacing": "None",
-                                }
-                                if location
-                                else None,
-                                {
-                                    "type": "TextBlock",
-                                    "text": f"👤 {organiser_name}",
-                                    "isSubtle": True,
-                                    "size": "Small",
-                                    "spacing": "None",
-                                }
-                                if show_organiser
-                                else None,
-                            ]
-                            if item is not None
-                        ],
-                    },
-                ],
-            })
+                            },
+                            {
+                                "type": "TextBlock",
+                                "text": f"📍 {location}",
+                                "isSubtle": True,
+                                "size": "Small",
+                                "wrap": True,
+                                "spacing": "None",
+                            } if location else None,
+                            {
+                                "type": "TextBlock",
+                                "text": f"👤 {organiser_name}",
+                                "isSubtle": True,
+                                "size": "Small",
+                                "spacing": "None",
+                            } if show_organiser else None,
+                        ]
+                        if item is not None
+                    ],
+                },
+            ],
+        })
+
+    return items
+
+
+# ── Agenda card builder ────────────────────────────────────────────────────────
+def _build_agenda_card(
+    events: list[dict],
+    now_london: datetime,
+    tz_label: str,
+    label: str = "TODAY'S AGENDA",
+    intro: str | None = None,
+) -> dict:
+    """
+    Build an agenda Adaptive Card for any given day.
+    WHY label and intro parameters:
+      label changes the card header — "TODAY'S AGENDA" vs "TOMORROW'S AGENDA".
+      intro adds an opening line before the event list — used for the 19:00
+      tomorrow card: "Here's what tomorrow looks like, Phillip."
+      Both default to today's values so existing call sites are unchanged.
+    """
+    date_str = now_london.strftime(f"%A %d %B — {tz_label}")
+
+    container_items: list[dict] = []
+
+    if intro:
+        container_items.append({
+            "type": "TextBlock",
+            "text": intro,
+            "size": "Medium",
+            "wrap": True,
+            "spacing": "None",
+        })
+
+    container_items += [
+        {
+            "type": "TextBlock",
+            "text": f"📅 {label}",
+            "weight": "Bolder",
+            "color": "Warning",
+            "spacing": "None" if not intro else "Small",
+        },
+        {
+            "type": "TextBlock",
+            "text": date_str,
+            "isSubtle": True,
+            "size": "Small",
+            "spacing": "None",
+        },
+        {
+            "type": "TextBlock",
+            "text": "─────────────────────",
+            "color": "Warning",
+            "spacing": "Small",
+        },
+    ]
+
+    container_items.extend(_build_event_items(events))
 
     return {
         "type": "AdaptiveCard",
@@ -700,29 +652,7 @@ def _build_agenda_card(
                 "type": "Container",
                 "style": "emphasis",
                 "bleed": True,
-                "items": [
-                    {
-                        "type": "TextBlock",
-                        "text": "📅 TODAY'S AGENDA",
-                        "weight": "Bolder",
-                        "color": "Warning",
-                        "spacing": "None",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": date_str,
-                        "isSubtle": True,
-                        "size": "Small",
-                        "spacing": "None",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": "─────────────────────",
-                        "color": "Warning",
-                        "spacing": "Small",
-                    },
-                    *event_items,
-                ],
+                "items": container_items,
             }
         ],
     }
@@ -732,13 +662,11 @@ def _build_agenda_card(
 def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     """
     Fetch emails from the Inbox received after `since`.
-    WHY $filter on receivedDateTime: Graph filters server-side, keeping payload small.
-    WHY top=100: a 2-hour window on a busy inbox might exceed the default 50-item limit.
-    WHY $orderby=receivedDateTime desc: list is reversed after fetching so the
-      concertina card stacks oldest-at-top — the natural chronological triage order.
+    WHY $filter on receivedDateTime: Graph filters server-side.
+    WHY top=100: a 2-hour window on a busy inbox can exceed 50 items.
     WHY fallback to 2 hours when since is None:
-      If last_run has never been written (e.g. first ever run, or blob was lost),
-      defaulting to 2 hours prevents a flood of historical mail on first use.
+      If last_run has never been written, defaulting to 2 hours prevents
+      a flood of historical mail on first use.
     """
     headers = {"Authorization": f"Bearer {token}"}
     if since:
@@ -747,12 +675,11 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
         two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=2)
         since_str     = two_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    filter_clause = f"receivedDateTime ge {since_str}"
     url = (
         "https://graph.microsoft.com/v1.0/users/"
         "cda66539-6f2a-4a27-a5a3-a493061f8711"
         "/mailFolders/Inbox/messages"
-        f"?$filter={filter_clause}"
+        f"?$filter=receivedDateTime ge {since_str}"
         "&$top=100"
         "&$select=id,subject,from,receivedDateTime,categories,isRead,bodyPreview"
         "&$orderby=receivedDateTime desc"
@@ -789,12 +716,13 @@ def _get_sender_photo(token: str, sender_email: str) -> str:
         logging.debug(f"emailDigest: internal photo lookup failed — {e}")
 
     try:
-        search_url = (
+        search_resp = requests.get(
             "https://graph.microsoft.com/v1.0/me/contacts"
             f"?$filter=emailAddresses/any(e:e/address eq '{sender_email}')"
-            "&$select=id&$top=1"
+            "&$select=id&$top=1",
+            headers=headers,
+            timeout=10,
         )
-        search_resp = requests.get(search_url, headers=headers, timeout=10)
         if search_resp.status_code == 200:
             contacts = search_resp.json().get("value", [])
             if contacts:
@@ -845,47 +773,328 @@ def _write_last_run(timestamp: datetime) -> None:
         logging.error(f"emailDigest: failed to write last_run blob — {e}")
 
 
-# ── Time formatting helpers ────────────────────────────────────────────────────
+# ── Time formatting helper ─────────────────────────────────────────────────────
 def _fmt_time(dt: datetime, tz_label: str) -> str:
     local = dt.astimezone(LONDON_TZ)
     return local.strftime(f"%H:%M {tz_label} on %a %d %b")
 
 
-def _greeting(now_london: datetime) -> str:
-    hour = now_london.hour
-    if hour < 12:
-        return "Good morning, Phillip"
-    elif hour < 17:
-        return "Good afternoon, Phillip"
-    else:
-        return "Good evening, Phillip"
+# ── Leo voice helpers ──────────────────────────────────────────────────────────
+def _greeting(hour: int, is_first_slot: bool) -> str:
+    """
+    Return the correct greeting for the slot.
+    WHY fixed per slot rather than random:
+      Leo's greetings are specific to time of day and defined by Phillip.
+      The alternation between 'Phillip' and 'Sir' is deliberate — it
+      reflects the register variation in the voice profile and ensures
+      neither form of address becomes monotonous across the day.
+    WHY is_first_slot takes precedence over hour:
+      On Sundays, the first slot is 07:00 UTC — not 05:00. is_first_slot
+      is already calculated correctly for Sunday suppression upstream,
+      so using it here means the morning greeting is always correct
+      regardless of the day.
+    """
+    if is_first_slot:
+        return "Good morning, Sir. Here's the day."
+    greetings = {
+        7:  "Morning, Phillip.",
+        9:  "Morning, Sir.",
+        11: "Morning, Phillip.",
+        13: "Good afternoon, Phillip.",
+        15: "Afternoon, Sir.",
+        17: "Evening, Sir.",
+        19: "Good evening, Phillip.",
+    }
+    return greetings.get(hour, "Good morning, Phillip.")
 
 
-# ── Greeting card builder ──────────────────────────────────────────────────────
-def _build_greeting_card(
-    now_london: datetime, tz_label: str, email_count: int
+def _email_count_line(count: int) -> str:
+    """
+    Return a Leo-voice email count line.
+    WHY short declaratives:
+      The previous text ('We have N emails for you to triage in this moment')
+      is too long and too soft for Leo's voice. Short declaratives —
+      'Four emails to work through.' — match the character profile exactly.
+    WHY number words up to twelve, then digits:
+      Written numbers read more naturally in a conversational context.
+      Above twelve, digits are clearer.
+    WHY random choice for zero:
+      Two equivalent phrasings for an empty inbox. Alternating at random
+      avoids the same line appearing every quiet morning.
+    """
+    if count == 0:
+        return random.choice(["Nothing in the inbox.", "Inbox is clear."])
+    word_map = {
+        1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five",
+        6: "Six", 7: "Seven", 8: "Eight", 9: "Nine", 10: "Ten",
+        11: "Eleven", 12: "Twelve",
+    }
+    word = word_map.get(count, str(count))
+    if count == 1:
+        return "One email."
+    return f"{word} emails to work through."
+
+
+# ── Morning briefing card builder ──────────────────────────────────────────────
+def _build_morning_briefing_card(
+    weather: dict | None,
+    events: list[dict],
+    now_london: datetime,
+    tz_label: str,
 ) -> dict:
     """
-    Build the opening greeting card — always the first message Leo delivers.
-    WHY greeting first:
-      A chief of staff greets the principal before delivering any briefing.
-      Including the email count here means Phillip knows his workload
-      before reading weather or agenda.
-    WHY Adaptive Card rather than plain text:
-      The card format gives us colour and size control — the large amber
-      greeting is visually distinct and immediately readable in the channel.
+    Build the unified first-slot card: greeting + weather + agenda.
+    WHY a single card rather than three:
+      Previously the first slot sent three separate cards — greeting,
+      weather, agenda. A single card is one scroll position, one message
+      in the channel, and a more coherent briefing. Leo greets and
+      briefs the day in one delivery. The email count and inbox follow
+      immediately in the concertina card.
+    WHY weather before agenda:
+      The day starts with conditions (weather), then commitments (agenda).
+      That is the natural planning order.
+    WHY weather section is conditional:
+      If the Open-Meteo fetch fails, the card renders without the weather
+      section rather than failing entirely. A morning without weather is
+      better than no morning card.
     """
-    greeting_text = _greeting(now_london)
+    date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
-    if email_count == 0:
-        triage_text = "Your inbox is clear — nothing to triage in this moment."
-    elif email_count == 1:
-        triage_text = "We have 1 email for you to triage in this moment."
-    else:
-        triage_text = (
-            f"We have {email_count} emails for you to triage in this moment."
-        )
+    items: list[dict] = [
+        {
+            "type": "TextBlock",
+            "text": "Good morning, Sir. Here's the day.",
+            "weight": "Bolder",
+            "size": "ExtraLarge",
+            "color": "Warning",
+            "spacing": "None",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": date_str,
+            "isSubtle": True,
+            "size": "Small",
+            "spacing": "None",
+        },
+    ]
 
+    # ── Weather section ───────────────────────────────────────────────────────
+    if weather:
+        today    = weather["today"]
+        forecast = weather["forecast"]
+
+        items.append({
+            "type": "TextBlock",
+            "text": "─────────────────────",
+            "color": "Warning",
+            "spacing": "Medium",
+        })
+        items.append({
+            "type": "TextBlock",
+            "text": "🌦️ WEATHER — BASINGSTOKE",
+            "weight": "Bolder",
+            "color": "Warning",
+            "spacing": "None",
+        })
+        items.append({
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "columns": [
+                {
+                    "type": "Column",
+                    "width": "auto",
+                    "verticalContentAlignment": "Center",
+                    "items": [
+                        {
+                            "type": "TextBlock",
+                            "text": today["emoji"],
+                            "size": "ExtraLarge",
+                            "spacing": "None",
+                        }
+                    ],
+                },
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "spacing": "Small",
+                    "items": [
+                        {
+                            "type": "TextBlock",
+                            "text": today["desc"],
+                            "weight": "Bolder",
+                            "size": "Large",
+                            "spacing": "None",
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": f"{today['high']}°C / {today['low']}°C",
+                            "size": "Medium",
+                            "spacing": "None",
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": (
+                                f"🌂 {today['rain_pct']}% chance of rain"
+                                f"   💨 {today['wind_kmh']} km/h {today['wind_dir']}"
+                            ),
+                            "isSubtle": True,
+                            "size": "Small",
+                            "wrap": True,
+                            "spacing": "None",
+                        },
+                    ],
+                },
+            ],
+        })
+
+        forecast_columns = []
+        for day in forecast:
+            dt       = datetime.strptime(day["date"], "%Y-%m-%d")
+            day_name = dt.strftime("%a")
+            forecast_columns.append({
+                "type": "Column",
+                "width": "stretch",
+                "items": [
+                    {
+                        "type": "TextBlock",
+                        "text": day_name,
+                        "horizontalAlignment": "Center",
+                        "weight": "Bolder",
+                        "size": "Small",
+                        "spacing": "None",
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": day["emoji"],
+                        "horizontalAlignment": "Center",
+                        "size": "Large",
+                        "spacing": "None",
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": f"{day['high']}°",
+                        "horizontalAlignment": "Center",
+                        "weight": "Bolder",
+                        "size": "Small",
+                        "spacing": "None",
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": f"{day['low']}°",
+                        "horizontalAlignment": "Center",
+                        "isSubtle": True,
+                        "size": "Small",
+                        "spacing": "None",
+                    },
+                ],
+            })
+
+        items.append({
+            "type": "TextBlock",
+            "text": "─────────────────────",
+            "color": "Warning",
+            "spacing": "Small",
+        })
+        items.append({"type": "ColumnSet", "spacing": "Small", "columns": forecast_columns})
+
+    # ── Agenda section ────────────────────────────────────────────────────────
+    items.append({
+        "type": "TextBlock",
+        "text": "─────────────────────",
+        "color": "Warning",
+        "spacing": "Medium",
+    })
+    items.append({
+        "type": "TextBlock",
+        "text": "📅 TODAY'S AGENDA",
+        "weight": "Bolder",
+        "color": "Warning",
+        "spacing": "None",
+    })
+    items.extend(_build_event_items(events))
+
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.5",
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": items,
+            }
+        ],
+    }
+
+
+# ── Clear inbox card builder ───────────────────────────────────────────────────
+def _build_clear_inbox_card(
+    greeting: str | None,
+    count_line: str,
+) -> dict:
+    """
+    Build a minimal card for slots where the inbox is empty.
+    WHY send a card rather than nothing:
+      Leo checks in at every slot. If he sends nothing when the inbox is
+      clear, Phillip has no confirmation the digest ran. The card is brief
+      — greeting (if applicable) and a single count line — but it confirms
+      the run happened and the inbox is genuinely empty.
+    WHY greeting is optional:
+      At the first slot, the greeting is already in the morning briefing
+      card. Passing greeting=None omits it from this card to avoid
+      a second "Good morning, Sir." in the channel.
+    """
+    items: list[dict] = []
+
+    if greeting:
+        items.append({
+            "type": "TextBlock",
+            "text": greeting,
+            "weight": "Bolder",
+            "size": "Large",
+            "color": "Warning",
+            "spacing": "None",
+        })
+
+    items.append({
+        "type": "TextBlock",
+        "text": count_line,
+        "size": "Medium",
+        "wrap": True,
+        "spacing": "Small" if greeting else "None",
+    })
+
+    return {
+        "type": "AdaptiveCard",
+        "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.5",
+        "body": [
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "bleed": True,
+                "items": items,
+            }
+        ],
+    }
+
+
+# ── Goodnight card builder ─────────────────────────────────────────────────────
+def _build_goodnight_card() -> dict:
+    """
+    Build the end-of-day closing card sent at 19:00 after the inbox and
+    tomorrow's agenda have been delivered.
+    WHY a dedicated card:
+      Leo closes the day the same way he would leave the Oval Office —
+      "Good night, Sir." It is the last thing in the channel each day.
+      A dedicated card gives it visual weight and a clear close.
+    WHY after tomorrow's agenda, not before:
+      Leo hands over the inbox, shows tomorrow, then closes. Saying
+      goodnight before the look-ahead would feel like leaving the room
+      before the briefing is finished.
+    """
     return {
         "type": "AdaptiveCard",
         "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
@@ -898,19 +1107,12 @@ def _build_greeting_card(
                 "items": [
                     {
                         "type": "TextBlock",
-                        "text": greeting_text,
+                        "text": "Good night, Sir.",
                         "weight": "Bolder",
                         "size": "ExtraLarge",
                         "color": "Warning",
                         "spacing": "None",
-                    },
-                    {
-                        "type": "TextBlock",
-                        "text": triage_text,
-                        "size": "Medium",
-                        "wrap": True,
-                        "spacing": "Small",
-                    },
+                    }
                 ],
             }
         ],
@@ -923,54 +1125,86 @@ def _build_concertina_card(
     tz_label: str,
     token: str,
     now_london: datetime,
+    greeting: str | None,
+    count_line: str,
 ) -> dict:
     """
     Build a single Adaptive Card containing all emails as collapsible rows.
     WHY concertina rather than one card per email:
-      The previous pattern sent one card per email, meaning Teams anchored
-      to the last card and Phillip had to scroll up through every email
-      before triaging — processing each one twice. A single card with all
-      emails collapsed means the full inbox is visible at a glance. Phillip
-      expands only the email he is triaging at that moment.
+      A single card with all emails collapsed means the full inbox is
+      visible at a glance. Phillip expands only the email he is triaging.
+      The previous one-card-per-email pattern anchored Teams to the last
+      card and required scrolling up through every email before triaging.
+    WHY greeting and count_line parameters:
+      At the first slot, greeting=None — the greeting was already delivered
+      in the morning briefing card. At all other slots, the greeting appears
+      at the top of the concertina header so Leo's voice opens every card.
+      count_line always appears below the greeting (or at the top if no
+      greeting) — it sits immediately above the emails it describes.
     WHY Action.ToggleVisibility:
-      This is the native Adaptive Card mechanism for show/hide without
-      requiring a round-trip to a backend. The toggle fires client-side
-      in Teams — instant response, no Bot Framework call needed.
-    WHY unique IDs per email (email_detail_0, email_detail_1 …):
-      Action.ToggleVisibility targets elements by their id. Each detail
-      section needs a unique id so toggling one row does not affect others.
-    WHY photos in the expanded detail only:
-      Showing photos in the collapsed summary row would make it much taller
-      and defeat the purpose of the compact view. Photos appear only when
-      an email is expanded, where there is space for them.
+      Native Adaptive Card mechanism for show/hide without a round-trip
+      to the backend. The toggle fires client-side in Teams — instant.
+    WHY triage button container styles:
+      Action=accent (blue), Waiting For=warning (amber),
+      View=emphasis (grey), Delete=attention (red). These are the four
+      native Adaptive Card container style values that produce distinct
+      background colours in Teams. Previously the buttons were unstyled
+      and indistinguishable from plain containers.
     """
     date_str = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
 
-    # Card header
+    # ── Card header ───────────────────────────────────────────────────────────
+    header_items: list[dict] = []
+
+    if greeting:
+        header_items.append({
+            "type": "TextBlock",
+            "text": greeting,
+            "weight": "Bolder",
+            "size": "Large",
+            "color": "Warning",
+            "spacing": "None",
+        })
+
+    header_items.append({
+        "type": "TextBlock",
+        "text": count_line,
+        "size": "Medium",
+        "wrap": True,
+        "spacing": "Small" if greeting else "None",
+    })
+
+    if not greeting:
+        # WHY EMAIL TRIAGE label only when there is no greeting:
+        #   When Leo greets, the context is clear — his name and the emails
+        #   follow immediately. When there is no greeting (first slot,
+        #   greeting already delivered), a label anchors the card.
+        header_items.insert(0, {
+            "type": "TextBlock",
+            "text": "📧 EMAIL TRIAGE",
+            "weight": "Bolder",
+            "color": "Warning",
+            "spacing": "None",
+        })
+
+    header_items.append({
+        "type": "TextBlock",
+        "text": date_str,
+        "isSubtle": True,
+        "size": "Small",
+        "spacing": "None",
+    })
+
     body: list[dict] = [
         {
             "type": "Container",
             "style": "emphasis",
             "bleed": True,
-            "items": [
-                {
-                    "type": "TextBlock",
-                    "text": "📧 EMAIL TRIAGE",
-                    "weight": "Bolder",
-                    "color": "Warning",
-                    "spacing": "None",
-                },
-                {
-                    "type": "TextBlock",
-                    "text": date_str,
-                    "isSubtle": True,
-                    "size": "Small",
-                    "spacing": "None",
-                },
-            ],
+            "items": header_items,
         }
     ]
 
+    # ── Email rows ────────────────────────────────────────────────────────────
     for i, email in enumerate(emails):
         sender_name  = (
             email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
@@ -987,22 +1221,17 @@ def _build_concertina_card(
 
         received_str = email.get("receivedDateTime", "")
         try:
-            received_utc    = datetime.fromisoformat(
-                received_str.replace("Z", "+00:00")
-            )
+            received_utc    = datetime.fromisoformat(received_str.replace("Z", "+00:00"))
             received_london = received_utc.astimezone(LONDON_TZ)
             time_label      = received_london.strftime("%H:%M")
         except Exception:
             time_label = ""
 
         detail_id = f"email_detail_{i}"
-
-        # Resolve sender photo (shown in expanded detail only)
         photo_uri = (
             _get_sender_photo(token, sender_addr) if sender_addr else ENVELOPE_ICON
         )
 
-        # Separator between emails (not before the first one)
         if i > 0:
             body.append({
                 "type": "TextBlock",
@@ -1012,10 +1241,10 @@ def _build_concertina_card(
                 "size": "Small",
             })
 
-        # ── Collapsed summary row (always visible) ────────────────────────────
+        # ── Collapsed summary row ─────────────────────────────────────────────
         # WHY selectAction on the Container:
-        #   Tapping anywhere on the summary row toggles the detail section.
-        #   This gives a large tap target, which is important on mobile.
+        #   Tapping anywhere on the row toggles the detail section.
+        #   Large tap target — important on mobile.
         body.append({
             "type": "Container",
             "spacing": "Small",
@@ -1078,17 +1307,13 @@ def _build_concertina_card(
             ],
         })
 
-        # ── Expanded detail section (hidden until tapped) ─────────────────────
-        # WHY isVisible: False:
-        #   The detail starts collapsed. Action.ToggleVisibility flips this
-        #   client-side in Teams when the summary row is tapped.
+        # ── Expanded detail section ───────────────────────────────────────────
         body.append({
             "type": "Container",
             "id": detail_id,
             "isVisible": False,
             "spacing": "Small",
             "items": [
-                # Sender photo + email address
                 {
                     "type": "ColumnSet",
                     "spacing": "Small",
@@ -1124,7 +1349,6 @@ def _build_concertina_card(
                         },
                     ],
                 },
-                # Body preview
                 {
                     "type": "TextBlock",
                     "text": body_preview,
@@ -1133,10 +1357,16 @@ def _build_concertina_card(
                     "maxLines": 4,
                     "spacing": "Small",
                 },
-                # Triage buttons
-                # NOTE: Button actions (move to Done, etc.) are placeholder
-                # Submit actions for now. A dedicated session will wire these
-                # to actual Graph API calls via the taskChain function.
+                # ── Triage buttons ────────────────────────────────────────────
+                # WHY container styles rather than default:
+                #   Previously all four buttons used style="default" and were
+                #   visually indistinguishable from plain containers. Native
+                #   Adaptive Card container styles — accent, warning, emphasis,
+                #   attention — produce distinct background colours in Teams,
+                #   making the buttons immediately readable as interactive controls.
+                # NOTE: Action.Submit payloads for Action and Waiting For are
+                #   placeholders. A dedicated session will wire these to Graph
+                #   API calls via the messages function and taskChain.
                 {
                     "type": "ColumnSet",
                     "spacing": "Small",
@@ -1147,7 +1377,7 @@ def _build_concertina_card(
                             "items": [
                                 {
                                     "type": "Container",
-                                    "style": "default",
+                                    "style": "accent",
                                     "selectAction": {
                                         "type": "Action.Submit",
                                         "data": {
@@ -1174,7 +1404,7 @@ def _build_concertina_card(
                             "items": [
                                 {
                                     "type": "Container",
-                                    "style": "default",
+                                    "style": "warning",
                                     "selectAction": {
                                         "type": "Action.Submit",
                                         "data": {
@@ -1201,7 +1431,7 @@ def _build_concertina_card(
                             "items": [
                                 {
                                     "type": "Container",
-                                    "style": "default",
+                                    "style": "emphasis",
                                     "selectAction": {
                                         "type": "Action.OpenUrl",
                                         "url": "https://outlook.office365.com/mail/",
@@ -1225,7 +1455,7 @@ def _build_concertina_card(
                             "items": [
                                 {
                                     "type": "Container",
-                                    "style": "default",
+                                    "style": "attention",
                                     "selectAction": {
                                         "type": "Action.Submit",
                                         "data": {
@@ -1270,7 +1500,7 @@ def _get_delivery_config() -> tuple[str, str, str, str]:
 
 def _send_text_to_teams(text: str) -> None:
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
-    url = f"{service_url}/v3/conversations/{channel_id}/activities"
+    url  = f"{service_url}/v3/conversations/{channel_id}/activities"
     resp = requests.post(
         url,
         headers={
@@ -1290,7 +1520,7 @@ def _send_text_to_teams(text: str) -> None:
 
 def _send_card_to_teams(card: dict) -> None:
     bot_token, service_url, channel_id, bot_app_id = _get_delivery_config()
-    url = f"{service_url}/v3/conversations/{channel_id}/activities"
+    url     = f"{service_url}/v3/conversations/{channel_id}/activities"
     payload = {
         "type": "message",
         "from": {"id": f"28:{bot_app_id}", "name": "Leo"},
