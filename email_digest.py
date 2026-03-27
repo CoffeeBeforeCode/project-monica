@@ -1358,123 +1358,54 @@ def _build_concertina_card(
                     "spacing": "Small",
                 },
                 # ── Triage buttons ────────────────────────────────────────────
-                # WHY container styles rather than default:
-                #   Previously all four buttons used style="default" and were
-                #   visually indistinguishable from plain containers. Native
-                #   Adaptive Card container styles — accent, warning, emphasis,
-                #   attention — produce distinct background colours in Teams,
-                #   making the buttons immediately readable as interactive controls.
+                # WHY ActionSet rather than container-based buttons:
+                #   Container-based buttons with style colours rendered as flat
+                #   pastel boxes — visually weak and not obviously interactive.
+                #   ActionSet renders native Teams buttons with proper visual
+                #   weight, raised appearance, and clear affordance.
+                # WHY these three styles:
+                #   positive  — blue, conventionally means "do something" (Action)
+                #   default   — neutral, for secondary actions (Waiting For, View)
+                #   destructive — red, conventionally means "irreversible" (Delete)
                 # NOTE: Action.Submit payloads for Action and Waiting For are
                 #   placeholders. A dedicated session will wire these to Graph
                 #   API calls via the messages function and taskChain.
                 {
-                    "type": "ColumnSet",
+                    "type": "ActionSet",
                     "spacing": "Small",
-                    "columns": [
+                    "actions": [
                         {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {
-                                    "type": "Container",
-                                    "style": "accent",
-                                    "selectAction": {
-                                        "type": "Action.Submit",
-                                        "data": {
-                                            "triageAction": "action",
-                                            "emailId": email_id,
-                                        },
-                                    },
-                                    "items": [
-                                        {
-                                            "type": "TextBlock",
-                                            "text": "Action",
-                                            "horizontalAlignment": "Center",
-                                            "weight": "Bolder",
-                                            "size": "Small",
-                                            "spacing": "Small",
-                                        }
-                                    ],
-                                }
-                            ],
+                            "type": "Action.Submit",
+                            "title": "Action",
+                            "style": "positive",
+                            "data": {
+                                "triageAction": "action",
+                                "emailId": email_id,
+                            },
                         },
                         {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {
-                                    "type": "Container",
-                                    "style": "warning",
-                                    "selectAction": {
-                                        "type": "Action.Submit",
-                                        "data": {
-                                            "triageAction": "waiting",
-                                            "emailId": email_id,
-                                        },
-                                    },
-                                    "items": [
-                                        {
-                                            "type": "TextBlock",
-                                            "text": "Waiting For",
-                                            "horizontalAlignment": "Center",
-                                            "weight": "Bolder",
-                                            "size": "Small",
-                                            "spacing": "Small",
-                                        }
-                                    ],
-                                }
-                            ],
+                            "type": "Action.Submit",
+                            "title": "Waiting For",
+                            "style": "default",
+                            "data": {
+                                "triageAction": "waiting",
+                                "emailId": email_id,
+                            },
                         },
                         {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {
-                                    "type": "Container",
-                                    "style": "emphasis",
-                                    "selectAction": {
-                                        "type": "Action.OpenUrl",
-                                        "url": "https://outlook.office365.com/mail/",
-                                    },
-                                    "items": [
-                                        {
-                                            "type": "TextBlock",
-                                            "text": "View",
-                                            "horizontalAlignment": "Center",
-                                            "weight": "Bolder",
-                                            "size": "Small",
-                                            "spacing": "Small",
-                                        }
-                                    ],
-                                }
-                            ],
+                            "type": "Action.OpenUrl",
+                            "title": "View",
+                            "style": "default",
+                            "url": "https://outlook.office365.com/mail/",
                         },
                         {
-                            "type": "Column",
-                            "width": "stretch",
-                            "items": [
-                                {
-                                    "type": "Container",
-                                    "style": "attention",
-                                    "selectAction": {
-                                        "type": "Action.Submit",
-                                        "data": {
-                                            "triageAction": "delete",
-                                            "emailId": email_id,
-                                        },
-                                    },
-                                    "items": [
-                                        {
-                                            "type": "TextBlock",
-                                            "text": "Delete",
-                                            "horizontalAlignment": "Center",
-                                            "weight": "Bolder",
-                                            "size": "Small",
-                                            "spacing": "Small",
-                                        }
-                                    ],
-                                }
-                            ],
+                            "type": "Action.Submit",
+                            "title": "Delete",
+                            "style": "destructive",
+                            "data": {
+                                "triageAction": "delete",
+                                "emailId": email_id,
+                            },
                         },
                     ],
                 },
