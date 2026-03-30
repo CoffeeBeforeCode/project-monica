@@ -72,19 +72,38 @@ Session 30 changes:
   - _build_event_items extracted as a shared helper.
 
 Session 31 changes:
-  - slot logic now uses London local time (now_london.hour / now_london.weekday)
-    rather than UTC. WEBSITE_TIME_ZONE=Europe/London is set on the Function App,
-    so the cron fires at London local time. Internal checks must match.
-  - Morning briefing card greeting split into two TextBlocks: "Good morning, Sir."
-    at ExtraLarge and "Here's the day." at Large, separated by a line break.
+  - Slot logic now uses London local time (now_london.hour /
+    now_london.weekday) rather than UTC. WEBSITE_TIME_ZONE=Europe/London
+    is set on the Function App, so the cron fires at London local time.
+    Internal checks must match.
+  - Morning briefing card greeting split into two TextBlocks:
+    "Good morning, Sir." at ExtraLarge and "Here's the day." at Large,
+    separated by a line break.
+
+Session 32 changes:
+  - Goodnight card font reduced from ExtraLarge to Large.
+  - ActionSet triage buttons split into two ActionSet blocks of two.
+    Resolves 3+1 wrapping on mobile — buttons now render as two rows
+    of two (Action / Waiting For on the first row; View / Delete on
+    the second).
+  - Market data added via yfinance. No API key required.
+    Morning slot: previous trading day's close for FTSE 100, S&P 500,
+    Dow Jones, and NASDAQ. Leo interprets direction in a single
+    sentence before the numbers. On Monday morning, time reference
+    is "on Friday" rather than "overnight".
+    Evening slot (19:00): FTSE final close only. US markets are still
+    live at 19:00 BST so no US figures are shown in the evening.
+    Both morning and evening market data are conditional — if the
+    fetch fails, the card renders without the section.
 
 Slot logic:
-  First slot  (weather + agenda + email digest):
+  First slot  (weather + agenda + markets + email digest):
     Mon–Sat: 05:00 London local time
     Sun:     07:00 London local time  (05:00 is suppressed)
   All other slots (email digest only):
     07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00
-  19:00 additionally delivers tomorrow's agenda and goodnight card.
+  19:00 additionally delivers FTSE close, tomorrow's agenda and
+  goodnight card.
 """
 import os
 import logging
@@ -92,6 +111,7 @@ import random
 import time
 import base64
 import requests
+import yfinance as yf
 import azure.functions as func
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -118,7 +138,6 @@ ENVELOPE_ICON = (
     "PSIyIiB5PSI0IiB3aWR0aD0iMjAiIGhlaWdodD0iMTYiIHJ4PSIyIiByeT0iMiIvPjxwb2x5"
     "bGluZSBwb2ludHM9IjIsNCAxMiwxMyAyMiw0Ii8+PC9zdmc+"
 )
-
 
 # ── Timer Trigger ─────────────────────────────────────────────────────────────
 @bp.timer_trigger(
@@ -148,6 +167,7 @@ def emailDigest(timer: func.TimerRequest) -> None:
 
     # ── Determine slot type ───────────────────────────────────────────────────
     is_first_slot = (weekday != 6 and hour == 5) or (weekday == 6 and hour == 7)
+    is_monday     = (weekday == 0)
 
     logging.info(
         f"emailDigest: starting at {now_utc.isoformat()} UTC "
@@ -206,7 +226,17 @@ def emailDigest(timer: func.TimerRequest) -> None:
         except Exception as e:
             logging.error(f"emailDigest: calendar fetch failed — {e}")
 
-        morning_card = _build_morning_briefing_card(weather, events, now_london, tz_label)
+        market_data = None
+        try:
+            market_data = _fetch_market_data(is_evening=False)
+        except Exception as e:
+            logging.error(f"emailDigest: morning market fetch failed — {e}")
+
+        morning_card = _build_morning_briefing_card(
+            weather, events, now_london, tz_label,
+            market_data=market_data,
+            is_monday=is_monday,
+        )
         _send_card_to_teams(morning_card)
         time.sleep(CARD_SEND_DELAY)
         logging.info("emailDigest: morning briefing card delivered")
@@ -218,28 +248,55 @@ def emailDigest(timer: func.TimerRequest) -> None:
                 greeting=None, count_line=count_line,
             )
             _send_card_to_teams(concertina_card)
-            logging.info(f"emailDigest: concertina card delivered — {len(emails)} email(s)")
+            logging.info(
+                f"emailDigest: concertina card delivered — {len(emails)} email(s)"
+            )
         else:
-            _send_card_to_teams(_build_clear_inbox_card(greeting=None, count_line=count_line))
+            _send_card_to_teams(
+                _build_clear_inbox_card(greeting=None, count_line=count_line)
+            )
             logging.info("emailDigest: inbox clear card delivered")
 
-    # ── 19:00: concertina + tomorrow's agenda + goodnight ─────────────────────
+    # ── 19:00: concertina + FTSE close + tomorrow's agenda + goodnight ────────
     elif hour == 19:
-        # WHY three cards at 19:00:
+        # WHY FTSE close in the evening concertina header:
+        #   US markets are still live at 19:00 BST — showing partial US
+        #   figures would be misleading. FTSE closed at 16:30 BST so the
+        #   final number is available. One line in the card header is
+        #   enough — Leo states direction, the number follows.
+        # WHY three further cards at 19:00:
         #   Leo closes the working day in sequence — here is the inbox,
         #   here is tomorrow, good night. The order matters: inbox is
         #   the last work action; the look-ahead is the transition;
-        #   goodnight is the close. Reversing the order would feel wrong.
+        #   goodnight is the close.
+        market_line = None
+        try:
+            market_data_eve = _fetch_market_data(is_evening=True)
+            if market_data_eve and "ftse" in market_data_eve:
+                market_line = _evening_ftse_line(market_data_eve["ftse"])
+        except Exception as e:
+            logging.error(f"emailDigest: evening market fetch failed — {e}")
+
         if emails:
             concertina_card = _build_concertina_card(
                 emails, tz_label, token, now_london,
                 greeting=greeting, count_line=count_line,
+                market_line=market_line,
             )
             _send_card_to_teams(concertina_card)
-            logging.info(f"emailDigest: concertina card delivered — {len(emails)} email(s)")
+            logging.info(
+                f"emailDigest: concertina card delivered — {len(emails)} email(s)"
+            )
         else:
-            _send_card_to_teams(_build_clear_inbox_card(greeting=greeting, count_line=count_line))
+            _send_card_to_teams(
+                _build_clear_inbox_card(
+                    greeting=greeting,
+                    count_line=count_line,
+                    market_line=market_line,
+                )
+            )
             logging.info("emailDigest: inbox clear card delivered")
+
         time.sleep(CARD_SEND_DELAY)
 
         try:
@@ -276,9 +333,13 @@ def emailDigest(timer: func.TimerRequest) -> None:
                 greeting=greeting, count_line=count_line,
             )
             _send_card_to_teams(concertina_card)
-            logging.info(f"emailDigest: concertina card delivered — {len(emails)} email(s)")
+            logging.info(
+                f"emailDigest: concertina card delivered — {len(emails)} email(s)"
+            )
         else:
-            _send_card_to_teams(_build_clear_inbox_card(greeting=greeting, count_line=count_line))
+            _send_card_to_teams(
+                _build_clear_inbox_card(greeting=greeting, count_line=count_line)
+            )
             logging.info("emailDigest: inbox clear card delivered")
 
 
@@ -422,6 +483,214 @@ def _degrees_to_compass(degrees: float) -> str:
     return directions[round(degrees / 45) % 8]
 
 
+# ── Market data fetching ───────────────────────────────────────────────────────
+def _fetch_market_data(is_evening: bool = False) -> dict | None:
+    """
+    Fetch market index closing data using yfinance.
+    WHY yfinance:
+      No API key required. Covers all four required indices with a
+      consistent call pattern. Modelled on _fetch_weather() — a helper
+      that fetches, parses, and returns a clean dict. If the fetch fails,
+      the caller logs the error and the card renders without the section.
+    WHY period="2d":
+      Returns the two most recent completed trading sessions.
+      iloc[-1] gives the most recent close. iloc[-2] gives the prior
+      session, used to calculate the day-over-day change percentage.
+      At 05:00 BST, markets are closed — the most recent session is
+      yesterday's close (or Friday's on Monday morning), which is
+      exactly what we want.
+    WHY is_evening:
+      At 19:00 BST, FTSE has closed (16:30 BST) but US markets are
+      still live. Showing partial US figures would be misleading.
+      When is_evening=True, only FTSE is fetched.
+    WHY float() conversion:
+      yfinance returns numpy float64 values. Converting to Python float
+      avoids serialisation issues if the dict is ever logged as JSON.
+    """
+    symbols = (
+        {"ftse": "^FTSE"}
+        if is_evening
+        else {
+            "ftse":   "^FTSE",
+            "sp500":  "^GSPC",
+            "dow":    "^DJI",
+            "nasdaq": "^IXIC",
+        }
+    )
+
+    results = {}
+    for key, symbol in symbols.items():
+        hist = yf.Ticker(symbol).history(period="2d")
+        if hist.empty:
+            logging.warning(f"emailDigest: no history returned for {symbol}")
+            continue
+        close = float(hist["Close"].iloc[-1])
+        if len(hist) >= 2:
+            prev_close = float(hist["Close"].iloc[-2])
+            change     = close - prev_close
+            change_pct = (change / prev_close) * 100
+        else:
+            change     = 0.0
+            change_pct = 0.0
+        results[key] = {
+            "close":      close,
+            "change":     change,
+            "change_pct": change_pct,
+        }
+
+    return results if results else None
+
+
+def _market_voice_line(market_data: dict, is_monday: bool) -> str:
+    """
+    Return a single Leo-voice sentence interpreting market direction.
+    WHY a sentence rather than numbers:
+      Leo briefs direction first. The numbers sit below as supporting
+      detail. Reading out a ticker is not Leo's register.
+    WHY is_monday:
+      On Monday morning the most recent session was Friday. "Overnight"
+      would be inaccurate. "On Friday" is precise and requires no
+      qualification from Phillip.
+    WHY S&P 500 as the US proxy:
+      The S&P is the broadest US index and the one most commonly
+      referenced in a leadership context. Dow and NASDAQ are shown
+      in the data rows below but do not drive the sentence.
+    """
+    time_ref = "on Friday" if is_monday else "overnight"
+
+    ftse  = market_data.get("ftse")
+    sp500 = market_data.get("sp500")
+
+    if not ftse and not sp500:
+        return ""
+
+    if ftse and sp500:
+        ftse_up = ftse["change_pct"] >= 0
+        sp_up   = sp500["change_pct"] >= 0
+
+        if ftse_up and sp_up:
+            return f"Both markets closed higher {time_ref}, Sir."
+        elif not ftse_up and not sp_up:
+            return f"Both markets closed lower {time_ref}."
+        elif sp_up and not ftse_up:
+            return f"Wall Street closed higher {time_ref}. London finished down."
+        else:
+            return f"Wall Street finished lower {time_ref}. London closed in the green."
+
+    if ftse:
+        direction = "higher" if ftse["change_pct"] >= 0 else "lower"
+        return f"London closed {direction} {time_ref}."
+
+    return ""
+
+
+def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
+    """
+    Build Adaptive Card body items for the markets section.
+    WHY voice_line first, then numbers:
+      Leo interprets direction in one sentence; the index rows are the
+      evidence beneath it. The same pattern as a human briefing —
+      conclusion first, supporting detail below.
+    WHY ▲/▼ with Good/Attention colour:
+      Direction is immediately legible without arithmetic. Green/red is
+      the universal market convention and maps to the Adaptive Card
+      colour tokens "Good" and "Attention".
+    WHY thousands separator, no decimals for large indices:
+      FTSE and Dow trade above 1,000 — decimal places add noise without
+      value at a briefing level. Percentage changes are shown to two
+      decimal places where precision matters.
+    """
+    items: list[dict] = []
+
+    if voice_line:
+        items.append({
+            "type": "TextBlock",
+            "text": voice_line,
+            "weight": "Bolder",
+            "size": "Medium",
+            "wrap": True,
+            "spacing": "None",
+        })
+
+    index_labels = {
+        "ftse":   "FTSE 100",
+        "sp500":  "S&P 500",
+        "dow":    "Dow Jones",
+        "nasdaq": "NASDAQ",
+    }
+
+    for key, label in index_labels.items():
+        entry = market_data.get(key)
+        if not entry:
+            continue
+
+        close      = entry["close"]
+        change_pct = entry["change_pct"]
+        up         = change_pct >= 0
+        arrow      = "▲" if up else "▼"
+        colour     = "Good" if up else "Attention"
+        close_str  = f"{close:,.0f}" if close >= 1000 else f"{close:,.2f}"
+        change_str = f"{arrow} {abs(change_pct):.2f}%"
+
+        items.append({
+            "type": "ColumnSet",
+            "spacing": "Small",
+            "columns": [
+                {
+                    "type": "Column",
+                    "width": "stretch",
+                    "items": [{
+                        "type": "TextBlock",
+                        "text": label,
+                        "size": "Small",
+                        "spacing": "None",
+                    }],
+                },
+                {
+                    "type": "Column",
+                    "width": "auto",
+                    "items": [{
+                        "type": "TextBlock",
+                        "text": close_str,
+                        "size": "Small",
+                        "weight": "Bolder",
+                        "horizontalAlignment": "Right",
+                        "spacing": "None",
+                    }],
+                },
+                {
+                    "type": "Column",
+                    "width": "auto",
+                    "items": [{
+                        "type": "TextBlock",
+                        "text": change_str,
+                        "size": "Small",
+                        "color": colour,
+                        "horizontalAlignment": "Right",
+                        "spacing": "None",
+                    }],
+                },
+            ],
+        })
+
+    return items
+
+
+def _evening_ftse_line(ftse: dict) -> str:
+    """
+    Build the single FTSE close line for the 19:00 card header.
+    WHY direction word rather than just a number:
+      Leo's voice leads with interpretation. "London closed higher today"
+      is the briefing; "FTSE 8,234  ▲ 0.42%" is the supporting detail.
+      Both appear in a single line so the header stays compact.
+    """
+    direction  = "higher" if ftse["change_pct"] >= 0 else "lower"
+    arrow      = "▲" if ftse["change_pct"] >= 0 else "▼"
+    close_str  = f"{ftse['close']:,.0f}"
+    change_str = f"{arrow} {abs(ftse['change_pct']):.2f}%"
+    return f"London closed {direction} today.  FTSE {close_str}  {change_str}"
+
+
 # ── Calendar fetching ──────────────────────────────────────────────────────────
 def _fetch_calendar_events(
     token: str, now_utc: datetime, day_offset: int = 0
@@ -469,7 +738,6 @@ def _fetch_calendar_events(
     resp.raise_for_status()
     data   = resp.json()
     events = data.get("value", [])
-
     if data.get("@odata.nextLink"):
         logging.warning("emailDigest: more than 20 events — some omitted")
 
@@ -485,7 +753,6 @@ def _fetch_calendar_events(
                 )
                 continue
         filtered.append(event)
-
     return filtered
 
 
@@ -527,7 +794,6 @@ def _build_event_items(events: list[dict]) -> list[dict]:
 
         subject  = (event.get("subject") or "No title").strip()
         location = (event.get("location", {}).get("displayName", "") or "").strip()
-
         organiser_email = (
             event.get("organizer", {})
                  .get("emailAddress", {})
@@ -597,7 +863,6 @@ def _build_event_items(events: list[dict]) -> list[dict]:
                 },
             ],
         })
-
     return items
 
 
@@ -620,7 +885,6 @@ def _build_agenda_card(
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
     container_items: list[dict] = []
-
     if intro:
         container_items.append({
             "type": "TextBlock",
@@ -652,7 +916,6 @@ def _build_agenda_card(
             "spacing": "Small",
         },
     ]
-
     container_items.extend(_build_event_items(events))
 
     return {
@@ -853,22 +1116,19 @@ def _build_morning_briefing_card(
     events: list[dict],
     now_london: datetime,
     tz_label: str,
+    market_data: dict | None = None,
+    is_monday: bool = False,
 ) -> dict:
     """
-    Build the unified first-slot card: greeting + weather + agenda.
-    WHY a single card rather than three:
-      Previously the first slot sent three separate cards — greeting,
-      weather, agenda. A single card is one scroll position, one message
-      in the channel, and a more coherent briefing. Leo greets and
-      briefs the day in one delivery. The email count and inbox follow
-      immediately in the concertina card.
-    WHY weather before agenda:
-      The day starts with conditions (weather), then commitments (agenda).
-      That is the natural planning order.
-    WHY weather section is conditional:
-      If the Open-Meteo fetch fails, the card renders without the weather
-      section rather than failing entirely. A morning without weather is
-      better than no morning card.
+    Build the unified first-slot card: greeting + markets + weather + agenda.
+    WHY markets before weather:
+      The natural CoS briefing order is: overnight context (markets),
+      today's conditions (weather), today's commitments (agenda).
+      Leo gives Phillip what happened while he slept before telling him
+      what the day will feel like.
+    WHY market_data is conditional:
+      If yfinance fails, the card renders without the markets section.
+      A morning without market data is better than no morning card.
     WHY greeting is two TextBlocks:
       "Good morning, Sir." is the address — large and immediate.
       "Here's the day." is the handover — one size smaller, visually
@@ -904,6 +1164,26 @@ def _build_morning_briefing_card(
             "spacing": "None",
         },
     ]
+
+    # ── Markets section ───────────────────────────────────────────────────────
+    if market_data:
+        voice_line = _market_voice_line(market_data, is_monday)
+        market_items = _build_market_items(market_data, voice_line)
+        if market_items:
+            items.append({
+                "type": "TextBlock",
+                "text": "─────────────────────",
+                "color": "Warning",
+                "spacing": "Medium",
+            })
+            items.append({
+                "type": "TextBlock",
+                "text": "📈 MARKETS",
+                "weight": "Bolder",
+                "color": "Warning",
+                "spacing": "None",
+            })
+            items.extend(market_items)
 
     # ── Weather section ───────────────────────────────────────────────────────
     if weather:
@@ -1059,6 +1339,7 @@ def _build_morning_briefing_card(
 def _build_clear_inbox_card(
     greeting: str | None,
     count_line: str,
+    market_line: str | None = None,
 ) -> dict:
     """
     Build a minimal card for slots where the inbox is empty.
@@ -1071,6 +1352,9 @@ def _build_clear_inbox_card(
       At the first slot, the greeting is already in the morning briefing
       card. Passing greeting=None omits it from this card to avoid
       a second "Good morning, Sir." in the channel.
+    WHY market_line is optional:
+      Only the 19:00 slot passes the FTSE close line. All other slots
+      pass None and the parameter has no effect.
     """
     items: list[dict] = []
 
@@ -1084,12 +1368,22 @@ def _build_clear_inbox_card(
             "spacing": "None",
         })
 
+    if market_line:
+        items.append({
+            "type": "TextBlock",
+            "text": market_line,
+            "size": "Small",
+            "isSubtle": True,
+            "wrap": True,
+            "spacing": "Small" if greeting else "None",
+        })
+
     items.append({
         "type": "TextBlock",
         "text": count_line,
         "size": "Medium",
         "wrap": True,
-        "spacing": "Small" if greeting else "None",
+        "spacing": "Small" if (greeting or market_line) else "None",
     })
 
     return {
@@ -1120,6 +1414,9 @@ def _build_goodnight_card() -> dict:
       Leo hands over the inbox, shows tomorrow, then closes. Saying
       goodnight before the look-ahead would feel like leaving the room
       before the briefing is finished.
+    WHY Large rather than ExtraLarge:
+      The goodnight card closes the day — it should feel settled and
+      calm rather than loud. Large has presence without announcing itself.
     """
     return {
         "type": "AdaptiveCard",
@@ -1135,7 +1432,7 @@ def _build_goodnight_card() -> dict:
                         "type": "TextBlock",
                         "text": "Good night, Sir.",
                         "weight": "Bolder",
-                        "size": "ExtraLarge",
+                        "size": "Large",
                         "color": "Warning",
                         "spacing": "None",
                     }
@@ -1153,6 +1450,7 @@ def _build_concertina_card(
     now_london: datetime,
     greeting: str | None,
     count_line: str,
+    market_line: str | None = None,
 ) -> dict:
     """
     Build a single Adaptive Card containing all emails as collapsible rows.
@@ -1167,15 +1465,17 @@ def _build_concertina_card(
       at the top of the concertina header so Leo's voice opens every card.
       count_line always appears below the greeting (or at the top if no
       greeting) — it sits immediately above the emails it describes.
+    WHY market_line is optional:
+      Only the 19:00 slot passes the FTSE close. All other slots pass
+      None so the parameter has no effect on daytime digests.
     WHY Action.ToggleVisibility:
       Native Adaptive Card mechanism for show/hide without a round-trip
       to the backend. The toggle fires client-side in Teams — instant.
-    WHY triage button container styles:
-      Action=accent (blue), Waiting For=warning (amber),
-      View=emphasis (grey), Delete=attention (red). These are the four
-      native Adaptive Card container style values that produce distinct
-      background colours in Teams. Previously the buttons were unstyled
-      and indistinguishable from plain containers.
+    WHY two ActionSet blocks rather than one:
+      A single ActionSet with four buttons wraps as 3+1 on mobile — the
+      Delete button drops to a second line on its own, which looks broken.
+      Splitting into two ActionSet blocks of two forces consistent 2+2
+      layout on all screen widths.
     """
     date_str = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
 
@@ -1192,12 +1492,22 @@ def _build_concertina_card(
             "spacing": "None",
         })
 
+    if market_line:
+        header_items.append({
+            "type": "TextBlock",
+            "text": market_line,
+            "size": "Small",
+            "isSubtle": True,
+            "wrap": True,
+            "spacing": "Small" if greeting else "None",
+        })
+
     header_items.append({
         "type": "TextBlock",
         "text": count_line,
         "size": "Medium",
         "wrap": True,
-        "spacing": "Small" if greeting else "None",
+        "spacing": "Small" if (greeting or market_line) else "None",
     })
 
     if not greeting:
@@ -1383,16 +1693,11 @@ def _build_concertina_card(
                     "maxLines": 4,
                     "spacing": "Small",
                 },
-                # ── Triage buttons ────────────────────────────────────────────
-                # WHY ActionSet rather than container-based buttons:
-                #   Container-based buttons with style colours rendered as flat
-                #   pastel boxes — visually weak and not obviously interactive.
-                #   ActionSet renders native Teams buttons with proper visual
-                #   weight, raised appearance, and clear affordance.
-                # WHY these three styles:
-                #   positive  — blue, conventionally means "do something" (Action)
-                #   default   — neutral, for secondary actions (Waiting For, View)
-                #   destructive — red, conventionally means "irreversible" (Delete)
+                # ── Triage buttons — row 1: Action + Waiting For ──────────────
+                # WHY two ActionSet blocks:
+                #   A single ActionSet with four buttons wraps as 3+1 on
+                #   mobile. Splitting into two blocks of two forces a
+                #   consistent 2+2 layout on all screen sizes.
                 # NOTE: Action.Submit payloads for Action and Waiting For are
                 #   placeholders. A dedicated session will wire these to Graph
                 #   API calls via the messages function and taskChain.
@@ -1418,6 +1723,13 @@ def _build_concertina_card(
                                 "emailId": email_id,
                             },
                         },
+                    ],
+                },
+                # ── Triage buttons — row 2: View + Delete ─────────────────────
+                {
+                    "type": "ActionSet",
+                    "spacing": "Small",
+                    "actions": [
                         {
                             "type": "Action.OpenUrl",
                             "title": "View",
