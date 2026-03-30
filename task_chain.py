@@ -3,12 +3,14 @@ import logging
 import requests
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 # Why: Blueprint allows this function to live in its own file while still
 # being registered under the main FunctionApp instance in function_app.py.
 bp = func.Blueprint()
 
-USER_ID = "cda66539-6f2a-4a27-a5a3-a493061f8711"
+USER_ID   = "cda66539-6f2a-4a27-a5a3-a493061f8711"
+LONDON_TZ = ZoneInfo("Europe/London")
 
 LIST_IDS = {
     "Admin":          "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA=",
@@ -28,7 +30,7 @@ def get_access_token() -> str:
     # variables at runtime. No credentials are stored in code.
     endpoint = os.environ["IDENTITY_ENDPOINT"]
     header   = os.environ["IDENTITY_HEADER"]
-    url = f"{endpoint}?api-version=2019-08-01&resource=https://graph.microsoft.com"
+    url      = f"{endpoint}?api-version=2019-08-01&resource=https://graph.microsoft.com"
     response = requests.get(url, headers={"X-IDENTITY-HEADER": header})
     response.raise_for_status()
     return response.json()["access_token"]
@@ -54,14 +56,14 @@ def get_list_id(list_name: str) -> str | None:
 
 def task_exists(token: str, list_id: str, title: str) -> bool:
     # Why: Prevents duplicate successor tasks. Graph often sends multiple
-    # notifications for a single completion event. Scoped to today to avoid
-    # false positives from recurring tasks with the same title.
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # notifications for a single completion event. Scoped to today (London
+    # date) to avoid false positives from recurring tasks with the same title.
+    today_london = datetime.now(LONDON_TZ).strftime("%Y-%m-%d")
     url = (
         f"https://graph.microsoft.com/v1.0/users/{USER_ID}"
         f"/todo/lists/{list_id}/tasks"
         f"?$filter=title eq '{title}'"
-        f" and createdDateTime ge {today}T00:00:00Z"
+        f" and createdDateTime ge {today_london}T00:00:00Z"
     )
     response = requests.get(url, headers={"Authorization": f"Bearer {token}"})
     if response.status_code != 200:
@@ -81,17 +83,26 @@ def create_task(
     due_time: str = None
 ) -> dict:
     # Why: Creates the successor task in the correct To Do list.
-    # category sets the GTD context label. due_time sets a same-day due
-    # time in UTC — used for Dry tasks so they surface at 19:00.
+    # category sets the GTD context label. due_time is a London local time
+    # string (HH:MM) from task-chains.json — converted to UTC before sending
+    # to Graph so Dry tasks surface at the correct local time year-round
+    # regardless of GMT/BST.
     body: dict = {"title": title}
 
     if category:
         body["categories"] = [category]
 
     if due_time:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # Why: Parse due_time as London local time and convert to UTC.
+        # "19:00" in task-chains.json means 19:00 on your clock — 18:00 UTC
+        # in BST, 19:00 UTC in GMT. Storing as London time in the JSON means
+        # the value never needs updating at clock changes.
+        now_london = datetime.now(LONDON_TZ)
+        h, m       = int(due_time.split(":")[0]), int(due_time.split(":")[1])
+        local_dt   = now_london.replace(hour=h, minute=m, second=0, microsecond=0)
+        due_dt_utc = local_dt.astimezone(timezone.utc)
         body["dueDateTime"] = {
-            "dateTime": f"{today}T{due_time}:00",
+            "dateTime": due_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.0000000"),
             "timeZone": "UTC"
         }
 
@@ -146,7 +157,7 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
 
     for notification in notifications:
         resource = notification.get("resource", "")
-        parts = resource.split("/")
+        parts    = resource.split("/")
 
         list_id_from_resource = None
         if "lists" in parts:
@@ -165,7 +176,7 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             logging.warning("Could not extract task ID from resource — skipping notification")
             continue
 
-        task_url = f"https://graph.microsoft.com/v1.0/{resource}"
+        task_url      = f"https://graph.microsoft.com/v1.0/{resource}"
         task_response = requests.get(
             task_url,
             headers={"Authorization": f"Bearer {token}"}
@@ -184,10 +195,10 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
         logging.info(f"Completed task detected: '{completed_title}'")
 
         for chain in chains:
-            if chain.get("trigger") != completed_title:
+            if chain.get("trigger_task") != completed_title:
                 continue
 
-            successor_title  = chain.get("successor")
+            successor_title  = chain.get("creates_task")
             target_list_name = chain.get("list")
             category         = chain.get("category")
             due_time         = chain.get("due_time")
