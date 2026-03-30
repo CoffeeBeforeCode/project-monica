@@ -8,9 +8,11 @@ This endpoint is the Bot Framework channel endpoint. Teams sends every
 message, reaction, and event addressed to Monica here as a JSON Activity
 object.
 
-Current state (Session 20):
+Current state (Session 33):
   - Validates the incoming request has a JSON body
-  - Logs the conversation ID and service URL
+  - Returns 200 immediately — before any Graph API work begins
+  - Dispatches message handling to a background thread so the Bot
+    Framework acknowledgement is never delayed by Graph API calls
   - Routes triage button presses (Action.Submit payloads) to the
     appropriate Graph API action: move, flag, delete, or create task
   - Falls back to plain-text acknowledgement for typed messages
@@ -25,6 +27,17 @@ Session 25 fix:
   - from.name set to "Leo" in _send_reply. Previously absent, causing
     Teams to fall back to the Azure Bot registration name "monica-bot".
 
+Session 33 fix:
+  - Bot Framework requires a 200 response within ~5 seconds.
+    Action and Waiting For involve 6-7 sequential Graph API calls —
+    more than enough to exceed that window and trigger "Unable to reach
+    app" in Teams. Delete succeeded because it makes only one call.
+  - Fix: return 200 immediately, then process the activity in a
+    background thread via threading.Thread. The Bot Framework gets its
+    acknowledgement within milliseconds. Graph work continues
+    uninterrupted in the background.
+  - No change to any triage logic, Graph helpers, or auth functions.
+
 WHY this file is self-contained:
   Same Blueprint pattern as all other Monica functions. A crash here
   affects only the bot endpoint — timers and task chains keep running.
@@ -34,6 +47,7 @@ import os
 import json
 import logging
 import requests
+import threading
 import azure.functions as func
 
 from datetime import datetime, timezone, timedelta
@@ -60,6 +74,20 @@ def messages(req: func.HttpRequest) -> func.HttpResponse:
       Bot Framework always delivers activities via POST. GET requests to
       this endpoint are not part of the protocol and are rejected cleanly.
 
+    WHY we return 200 before processing:
+      The Bot Framework requires a 200 acknowledgement within ~5 seconds.
+      Action and Waiting For triage actions involve 6–7 sequential Graph
+      API calls. Running those calls synchronously on the request thread
+      exceeds the timeout and Teams shows "Unable to reach app".
+      Returning 200 immediately and dispatching to a background thread
+      means Teams gets its acknowledgement within milliseconds. The Graph
+      work continues in the background regardless.
+
+    WHY we still parse the body before spawning the thread:
+      If the body is not valid JSON, we return 400 before spawning
+      anything — no point starting a thread for a malformed request.
+      The 400 path is fast and does not risk the timeout.
+
     WHY we log CONVERSATION_ID_CAPTURE and SERVICE_URL_CAPTURE:
       These values are needed to deliver proactive messages back to Teams.
       They were captured in Session 12 and stored in Key Vault, but we
@@ -83,23 +111,53 @@ def messages(req: func.HttpRequest) -> func.HttpResponse:
     logging.info(f"CONVERSATION_ID_CAPTURE: {conversation_id}")
     logging.info(f"SERVICE_URL_CAPTURE: {service_url}")
 
-    # ── Activity type routing ─────────────────────────────────────────────────
-    activity_type = body.get("type", "")
-    logging.info(f"messages: activity type = {activity_type}")
+    # ── Acknowledge immediately ───────────────────────────────────────────────
+    # WHY daemon=True:
+    #   A daemon thread is automatically killed when the main process
+    #   exits. This is the correct choice for a fire-and-forget background
+    #   task — we do not want the Azure Functions host to stay alive
+    #   waiting for the thread to finish before it can recycle.
+    thread = threading.Thread(
+        target=_process_activity,
+        args=(body, service_url, conversation_id),
+        daemon=True,
+    )
+    thread.start()
 
-    if activity_type == "message":
-        _handle_message(body, service_url, conversation_id)
-    elif activity_type == "conversationUpdate":
-        # WHY no reply: replying to conversationUpdate can cause unwanted
-        # messages when Monica is first installed in a conversation.
-        logging.info("messages: conversationUpdate received — no reply sent")
-    else:
-        logging.info(f"messages: unhandled activity type '{activity_type}'")
-
-    # WHY 200 with empty body:
-    #   Bot Framework expects a 200 response within 15 seconds. An empty
-    #   200 is the correct acknowledgement — it prevents Teams from retrying.
     return func.HttpResponse(status_code=200)
+
+
+# ── Activity processor (runs in background thread) ────────────────────────────
+def _process_activity(body: dict, service_url: str, conversation_id: str) -> None:
+    """
+    Process the Teams activity in a background thread.
+
+    WHY separated from the HTTP trigger:
+      The HTTP trigger must return 200 immediately. This function contains
+      all the work that would previously have blocked that return. Separating
+      them makes the timing responsibility explicit — the trigger owns the
+      acknowledgement; this function owns the processing.
+
+    WHY we catch all exceptions at the top level:
+      An unhandled exception in a background thread is silently swallowed
+      by Python. Catching at the top level ensures any failure is logged
+      and visible in Application Insights rather than disappearing.
+    """
+    try:
+        activity_type = body.get("type", "")
+        logging.info(f"messages: activity type = {activity_type}")
+
+        if activity_type == "message":
+            _handle_message(body, service_url, conversation_id)
+        elif activity_type == "conversationUpdate":
+            # WHY no reply: replying to conversationUpdate can cause unwanted
+            # messages when Monica is first installed in a conversation.
+            logging.info("messages: conversationUpdate received — no reply sent")
+        else:
+            logging.info(f"messages: unhandled activity type '{activity_type}'")
+
+    except Exception as e:
+        logging.error(f"messages: unhandled exception in background thread — {e}")
 
 
 # ── Message handler ────────────────────────────────────────────────────────────
