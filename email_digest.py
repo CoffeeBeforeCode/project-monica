@@ -1,6 +1,6 @@
 """
 email_digest.py — Monica Email Digest Timer Trigger
-Fires every 2 hours (05:00–19:00 UTC daily).
+Fires every 2 hours (05:00–19:00 London local time daily).
 On Sundays, the 05:00 slot is suppressed in code.
 Fetches emails received since the last digest run and delivers them as a
 single concertina Adaptive Card to the Teams Daily Operations channel via
@@ -71,10 +71,17 @@ Session 30 changes:
   - _build_agenda_card gains label and intro parameters (used for tomorrow).
   - _build_event_items extracted as a shared helper.
 
+Session 31 changes:
+  - slot logic now uses London local time (now_london.hour / now_london.weekday)
+    rather than UTC. WEBSITE_TIME_ZONE=Europe/London is set on the Function App,
+    so the cron fires at London local time. Internal checks must match.
+  - Morning briefing card greeting split into two TextBlocks: "Good morning, Sir."
+    at ExtraLarge and "Here's the day." at Large, separated by a line break.
+
 Slot logic:
   First slot  (weather + agenda + email digest):
-    Mon–Sat: 05:00 UTC
-    Sun:     07:00 UTC  (05:00 is suppressed)
+    Mon–Sat: 05:00 London local time
+    Sun:     07:00 London local time  (05:00 is suppressed)
   All other slots (email digest only):
     07:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00
   19:00 additionally delivers tomorrow's agenda and goodnight card.
@@ -124,22 +131,27 @@ def emailDigest(timer: func.TimerRequest) -> None:
     now_utc    = datetime.now(timezone.utc)
     now_london = now_utc.astimezone(LONDON_TZ)
     tz_label   = "BST" if now_london.utcoffset() == timedelta(hours=1) else "GMT"
-    weekday    = now_utc.weekday()   # 0=Mon … 6=Sun
-    hour       = now_utc.hour
 
-    # Suppress Sunday 05:00 UTC
+    # WHY slot logic uses London local time:
+    #   WEBSITE_TIME_ZONE=Europe/London is set on the Function App, so the
+    #   cron fires at London local time year-round. weekday and hour must
+    #   be derived from now_london so that Sunday suppression, first-slot
+    #   detection, greeting selection, and the 19:00 close all stay correct
+    #   regardless of whether GMT or BST is in effect.
+    weekday = now_london.weekday()   # 0=Mon … 6=Sun
+    hour    = now_london.hour
+
+    # Suppress Sunday 05:00 London time
     if weekday == 6 and hour == 5:
-        logging.info("emailDigest: Sunday 05:00 UTC suppressed.")
+        logging.info("emailDigest: Sunday 05:00 suppressed.")
         return
 
     # ── Determine slot type ───────────────────────────────────────────────────
-    # WHY slot logic in UTC:
-    #   The cron schedule is defined in UTC. Comparing against UTC hour
-    #   is therefore always correct, even when London is in BST.
     is_first_slot = (weekday != 6 and hour == 5) or (weekday == 6 and hour == 7)
 
     logging.info(
-        f"emailDigest: starting at {now_utc.isoformat()} UTC — "
+        f"emailDigest: starting at {now_utc.isoformat()} UTC "
+        f"({now_london.strftime('%H:%M')} {tz_label}) — "
         f"first_slot={is_first_slot}, hour={hour}"
     )
 
@@ -789,7 +801,7 @@ def _greeting(hour: int, is_first_slot: bool) -> str:
       reflects the register variation in the voice profile and ensures
       neither form of address becomes monotonous across the day.
     WHY is_first_slot takes precedence over hour:
-      On Sundays, the first slot is 07:00 UTC — not 05:00. is_first_slot
+      On Sundays, the first slot is 07:00 — not 05:00. is_first_slot
       is already calculated correctly for Sunday suppression upstream,
       so using it here means the morning greeting is always correct
       regardless of the day.
@@ -857,15 +869,29 @@ def _build_morning_briefing_card(
       If the Open-Meteo fetch fails, the card renders without the weather
       section rather than failing entirely. A morning without weather is
       better than no morning card.
+    WHY greeting is two TextBlocks:
+      "Good morning, Sir." is the address — large and immediate.
+      "Here's the day." is the handover — one size smaller, visually
+      subordinate. The line break gives each phrase its own weight
+      without requiring a separate card.
     """
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
 
     items: list[dict] = [
         {
             "type": "TextBlock",
-            "text": "Good morning, Sir. Here's the day.",
+            "text": "Good morning, Sir.",
             "weight": "Bolder",
             "size": "ExtraLarge",
+            "color": "Warning",
+            "spacing": "None",
+            "wrap": True,
+        },
+        {
+            "type": "TextBlock",
+            "text": "Here's the day.",
+            "weight": "Bolder",
+            "size": "Large",
             "color": "Warning",
             "spacing": "None",
             "wrap": True,
