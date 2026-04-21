@@ -69,7 +69,7 @@ jobs:
         with:
           app-name: 'monica-functions-pc'
           slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}a
           publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
 
       # WHY Teams notification:
