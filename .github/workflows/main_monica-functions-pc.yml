@@ -7,6 +7,17 @@ on:
     branches:
       - main
   workflow_dispatch:
+
+# WHY concurrency:
+#   Committing multiple files in quick succession triggers a GitHub Actions
+#   run for each push. Without concurrency control, simultaneous deployments
+#   collide at Kudu's ZIP deploy endpoint with a 409 Conflict error.
+#   cancel-in-progress: false means new runs queue and wait rather than
+#   cancelling the run in progress — every deployment completes in order.
+concurrency:
+  group: azure-deploy
+  cancel-in-progress: false
+
 env:
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.12'
@@ -18,31 +29,26 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Setup Python version
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-
       - name: Install dependencies into .python_packages
         # Why: The functions-action sets SCM_DO_BUILD_DURING_DEPLOYMENT=false
         # before every deploy, disabling Oryx. Packages must therefore be
         # pre-bundled in the zip at .python_packages/lib/site-packages — the
         # exact path the Azure Functions Python worker checks when Oryx is off.
         run: pip install --target=".python_packages/lib/site-packages" -r requirements.txt
-
       - name: Zip artifact for deployment
         # Why: 'zip -r release.zip .' includes hidden directories like
         # .python_packages. The original './*' glob silently excluded them,
         # which is why packages were missing from every previous deployment.
         run: zip -r release.zip . --exclude='.git/*'
-
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: python-app
           path: release.zip
-
   deploy:
     runs-on: ubuntu-latest
     needs: build
@@ -53,12 +59,10 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-
       - name: Unzip artifact for deployment
         run: |
           unzip release.zip
           rm release.zip
-
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         id: deploy-to-function
@@ -67,3 +71,24 @@ jobs:
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+
+      # WHY Teams notification:
+      #   Leo confirms every deployment to the Projects channel.
+      #   if: always() ensures the notification fires on both success and
+      #   failure — a failed deployment is exactly when you most need to know.
+      #   The commit message is injected so the notification doubles as a
+      #   changelog entry: "Deployed. Session 33: digest refactor."
+      #   MS_TEAMS_WEBHOOK_URI must be saved as a GitHub repository secret.
+      #   The incoming webhook is configured on the Projects channel in Teams.
+      - name: Notify Projects channel
+        if: always()
+        uses: jdcargile/ms-teams-notification@v1.4
+        with:
+          github-token: ${{ github.token }}
+          ms-teams-webhook-uri: ${{ secrets.MS_TEAMS_WEBHOOK_URI }}
+          notification-summary: >-
+            ${{ job.status == 'success'
+              && format('Deployed. {0}', github.event.head_commit.message)
+              || format('Deployment failed — {0}. Check the Actions log.', github.event.head_commit.message) }}
+          notification-color: ${{ job.status == 'success' && '28a745' || 'dc3545' }}
+          timezone: Europe/London
