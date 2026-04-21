@@ -77,6 +77,13 @@ jobs:
       #   changelog entry: "Deployment confirmed. Session 34: digest refactor."
       #   MS_TEAMS_WEBHOOK_URI must be saved as a GitHub repository secret.
       #   The incoming webhook is configured via Power Automate on the Projects channel.
+      #
+      # WHY three-state colour coding:
+      #   job.status has three possible values: success, failure, and cancelled.
+      #   Green (28a745) = confirmed deployment, no action needed.
+      #   Amber (ffc107) = run was stopped — not broken, but worth knowing.
+      #   Red (dc3545) = something went wrong, action required.
+      #   Showing cancelled as red is misleading — amber is the correct signal.
       - name: Notify Projects channel
         if: always()
         uses: jdcargile/ms-teams-notification@v1.4
@@ -86,6 +93,11 @@ jobs:
           notification-summary: >-
             ${{ job.status == 'success'
               && format('Deployment confirmed. {0}. No action required.', github.event.head_commit.message)
+              || job.status == 'cancelled'
+              && format('Deployment cancelled. {0}.', github.event.head_commit.message)
               || format('Deployment failed. {0}. Check the Actions log.', github.event.head_commit.message) }}
-          notification-color: ${{ job.status == 'success' && '28a745' || 'dc3545' }}
+          notification-color: >-
+            ${{ job.status == 'success' && '28a745'
+              || job.status == 'cancelled' && 'ffc107'
+              || 'dc3545' }}
           timezone: Europe/London
