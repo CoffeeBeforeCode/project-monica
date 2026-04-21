@@ -7,7 +7,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-
 # WHY concurrency:
 #   Committing multiple files in quick succession triggers a GitHub Actions
 #   run for each push. Without concurrency control, simultaneous deployments
@@ -17,7 +16,6 @@ on:
 concurrency:
   group: azure-deploy
   cancel-in-progress: false
-
 env:
   AZURE_FUNCTIONAPP_PACKAGE_PATH: '.'
   PYTHON_VERSION: '3.12'
@@ -69,17 +67,16 @@ jobs:
         with:
           app-name: 'monica-functions-pc'
           slot-name: 'Production'
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}a
+          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
-
       # WHY Teams notification:
       #   Leo confirms every deployment to the Projects channel.
       #   if: always() ensures the notification fires on both success and
       #   failure — a failed deployment is exactly when you most need to know.
       #   The commit message is injected so the notification doubles as a
-      #   changelog entry: "Deployed. Session 33: digest refactor."
+      #   changelog entry: "Deployment confirmed. Session 34: digest refactor."
       #   MS_TEAMS_WEBHOOK_URI must be saved as a GitHub repository secret.
-      #   The incoming webhook is configured on the Projects channel in Teams.
+      #   The incoming webhook is configured via Power Automate on the Projects channel.
       - name: Notify Projects channel
         if: always()
         uses: jdcargile/ms-teams-notification@v1.4
@@ -88,7 +85,7 @@ jobs:
           ms-teams-webhook-uri: ${{ secrets.MS_TEAMS_WEBHOOK_URI }}
           notification-summary: >-
             ${{ job.status == 'success'
-              && format('Deployed. {0}', github.event.head_commit.message)
-              || format('Deployment failed — {0}. Check the Actions log.', github.event.head_commit.message) }}
+              && format('Deployment confirmed. {0}. No action required.', github.event.head_commit.message)
+              || format('Deployment failed. {0}. Check the Actions log.', github.event.head_commit.message) }}
           notification-color: ${{ job.status == 'success' && '28a745' || 'dc3545' }}
           timezone: Europe/London
