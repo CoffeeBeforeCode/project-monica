@@ -9,12 +9,13 @@ WHY this file exists:
   Keeping this file small means that a syntax error in any Blueprint file
   crashes only that Blueprint. If this file itself crashes, all functions
   go down — so it must stay simple and free of logic.
-Current function inventory (19 timer triggers + 3 HTTP triggers = 22 total):
+Current function inventory (19 timer triggers + 3 HTTP triggers = 23 total):
   File                     Function                    Type
   ─────────────────────────────────────────────────────────────────────────
   function_app.py          ping                        HTTP Trigger
   task_chain.py            taskChain                   HTTP Trigger
   messages.py              messages                    HTTP Trigger
+  pre_warm.py              preWarm                     Timer — daily 04:45
   email_digest_0500.py     emailDigest0500             Timer — daily 05:00
   email_digest_0700.py     emailDigest0700             Timer — daily 07:00
   email_digest_0900.py     emailDigest0900             Timer — daily 09:00
@@ -34,6 +35,15 @@ Current function inventory (19 timer triggers + 3 HTTP triggers = 22 total):
   task_sunday.py           createSundayTasks           Timer — Sunday 17:00
   task_monthly.py          createMonthlyTasks          Timer — 1st of month 05:00
   task_guardian.py         taskGuardian                Timer — daily 08:00
+  Session 34 change:
+    pre_warm.py registered as a Blueprint. Previously present in the repo
+    but not registered — the 04:45 pre-flight timer was therefore not firing.
+    This is the most likely cause of the 05:00 slot misses observed on
+    22 April 2026. pre_warm fires 15 minutes before the critical 05:00
+    window, waking the host if the platform has recycled it overnight.
+    If PRE_WARM_OK appears in Application Insights at 04:45, the host was
+    alive before 05:00. If PRE_WARM_LATE appears, the host was recycled and
+    the 05:00 window was at risk.
   Session 33 change:
     email_digest.py (single file, single timer trigger covering all slots
     via runtime conditional logic) replaced by eight independent slot files
@@ -52,6 +62,7 @@ import azure.functions as func
 #   Every Blueprint file exports a variable named `bp`. If we imported them
 #   all as `bp`, each import would overwrite the previous. Aliasing makes
 #   each one distinct and makes the registration list below self-documenting.
+from pre_warm            import bp_pre_warm
 from task_chain          import bp as bp_task_chain
 from messages            import bp as bp_messages
 from email_digest_0500   import bp as bp_digest_0500
@@ -84,6 +95,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 #   digest_shared.py is a plain Python module containing shared helpers and
 #   constants. It exports no Blueprint and defines no timer trigger. It is
 #   imported directly by the eight slot files — not by function_app.py.
+app.register_blueprint(bp_pre_warm)
 app.register_blueprint(bp_task_chain)
 app.register_blueprint(bp_messages)
 app.register_blueprint(bp_digest_0500)
