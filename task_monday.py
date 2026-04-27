@@ -1,4 +1,3 @@
-# task_monday.py
 import azure.functions as func
 import logging
 import os
@@ -10,6 +9,7 @@ bp = func.Blueprint()
 
 USER_ID      = "cda66539-6f2a-4a27-a5a3-a493061f8711"
 HOME_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
+ADMIN_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA="
 LONDON_TZ    = ZoneInfo("Europe/London")
 
 
@@ -76,14 +76,19 @@ def createMondayTasks(timer: func.TimerRequest) -> None:
     Why: Fires every Monday at 05:00 London local time. Blue Monday laundry
     and the weekly vacuum. The vacuum gets a 09:00 London reminder so it
     surfaces again mid-morning if not yet done.
+    LinkedIn and Upwork are due at 09:00 so they surface at the start of
+    the working day rather than alongside the household tasks at 05:00.
     """
     logging.info("createMondayTasks fired")
     token = get_access_token()
     if not token:
         return
 
-    morning  = today_london_at(5, 0)
-    reminder = today_london_at(9, 0)
+    morning   = today_london_at(5, 0)
+    workhour  = today_london_at(9, 0)
+    reminder  = today_london_at(9, 0)
 
-    create_todo_task(token, HOME_LIST_ID, "Wash: Blue Monday",        "[00] System", due_utc=morning)
-    create_todo_task(token, HOME_LIST_ID, "Vacuum: through and dust", "[00] System", due_utc=morning, reminder_utc=reminder)
+    create_todo_task(token, HOME_LIST_ID,  "Wash: Blue Monday",        "[00] System", due_utc=morning)
+    create_todo_task(token, HOME_LIST_ID,  "Vacuum: through and dust", "[00] System", due_utc=morning, reminder_utc=reminder)
+    create_todo_task(token, ADMIN_LIST_ID, "Check: LinkedIn",          "[02] Work",   due_utc=workhour)
+    create_todo_task(token, ADMIN_LIST_ID, "Prospect: Upwork",         "[02] Work",   due_utc=workhour)
