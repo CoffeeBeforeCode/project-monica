@@ -73,12 +73,18 @@ def today_london_at(hour: int, minute: int = 0) -> datetime:
 def createSaturdayTasks(timer: func.TimerRequest) -> None:
     """
     Why: Fires every Saturday at 17:00 London local time.
-    The bins were placed out on Friday morning and collected during the day.
-    The Saturday evening task is the prompt to bring them back in.
+    Empty: Bins — the bins were placed out on Friday morning and collected
+    during the day. The Saturday evening task is the prompt to bring them
+    back in.
+    Change: Tea Towel — part of the every-other-day tea towel rotation
+    across Tuesday, Thursday, Saturday, and Sunday evenings.
     """
     logging.info("createSaturdayTasks fired")
     token = get_access_token()
     if not token:
         return
 
-    create_todo_task(token, HOME_LIST_ID, "Empty: Bins", "[00] System", due_utc=today_london_at(17, 0))
+    evening = today_london_at(17, 0)
+
+    create_todo_task(token, HOME_LIST_ID, "Empty: Bins",        "[00] System", due_utc=evening)
+    create_todo_task(token, HOME_LIST_ID, "Change: Tea Towel",  "[00] System", due_utc=evening)
