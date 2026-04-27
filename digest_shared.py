@@ -33,12 +33,19 @@ Session 33 changes from the original email_digest.py:
   - _fetch_market_data() period changed from '2d' to '1y' to support
     comparative context. The additional data volume is handled efficiently
     by yfinance and does not affect runtime meaningfully.
+
+Session 37 changes:
+  - urllib.parse imported to support View button deep linking.
+  - View button URL in _build_concertina_card now encodes the Graph
+    message ID and deep-links directly to the specific email in Outlook
+    on the web, rather than opening the inbox root.
 """
 
 import os
 import logging
 import random
 import base64
+import urllib.parse
 import requests
 import yfinance as yf
 from datetime import datetime, timezone, timedelta
@@ -46,7 +53,6 @@ from zoneinfo import ZoneInfo
 from azure.storage.blob import BlobServiceClient
 
 # ── Constants ────────────────────────────────────────────────────────────────
-
 LONDON_TZ      = ZoneInfo("Europe/London")
 BLOB_CONTAINER = "monica-digest"
 BLOB_NAME      = "last_run.txt"
@@ -66,10 +72,10 @@ ENVELOPE_ICON = (
 )
 
 # ── Authentication ─────────────────────────────────────────────────────────────
-
 def get_access_token() -> str | None:
     """
     Obtain a Microsoft Graph access token via Managed Identity.
+
     WHY IDENTITY_ENDPOINT and IDENTITY_HEADER:
       Azure Functions provides these automatically at runtime. They point
       to a local token broker. The 169.254.169.254 VM metadata address
@@ -97,6 +103,7 @@ def get_access_token() -> str | None:
 def _get_bot_token() -> str:
     """
     Bot Framework access token via client credentials.
+
     WHY separate from the Graph token:
       Graph and Bot Framework use different OAuth audiences and
       credential flows. They cannot share a token.
@@ -117,14 +124,16 @@ def _get_bot_token() -> str:
     resp.raise_for_status()
     return resp.json()["access_token"]
 
-# ── Weather fetching ───────────────────────────────────────────────────────────
 
+# ── Weather fetching ───────────────────────────────────────────────────────────
 def _fetch_weather() -> dict:
     """
     Fetch a 5-day forecast from Open-Meteo for Basingstoke RG21 5NP.
+
     WHY Open-Meteo:
       Free with no API key required. No Key Vault secret needed. Excellent
       UK coverage at Monica's usage volume.
+
     WHY daily rather than hourly:
       The morning card gives a day-level overview. Hourly data is more
       detail than is useful at 05:00.
@@ -162,6 +171,7 @@ def _fetch_weather() -> dict:
 def _wmo_to_label(code: int) -> tuple[str, str]:
     """
     Map a WMO weather interpretation code to an emoji and short description.
+
     WHY emoji rather than weather icon images:
       External image URLs have no guaranteed uptime. Emoji render natively
       in Teams TextBlocks with zero external dependency.
@@ -198,6 +208,7 @@ def _wmo_to_label(code: int) -> tuple[str, str]:
 def _degrees_to_compass(degrees: float) -> str:
     """
     Convert a wind direction in degrees to a compass point.
+
     WHY compass rather than degrees:
       "Wind from the SW" is immediately meaningful. "225°" requires
       mental conversion.
@@ -205,30 +216,35 @@ def _degrees_to_compass(degrees: float) -> str:
     directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
     return directions[round(degrees / 45) % 8]
 
-# ── Market data fetching ───────────────────────────────────────────────────────
 
+# ── Market data fetching ───────────────────────────────────────────────────────
 def _fetch_market_data(is_evening: bool = False) -> dict | None:
     """
     Fetch market index closing data using yfinance, including comparative context.
+
     WHY yfinance:
       No API key required. Covers all five required indices with a
       consistent call pattern.
+
     WHY period='1y':
       Returns a full year of trading sessions. iloc[-1] is the most recent
       close; iloc[-2] is the prior session for the day-over-day change;
       iloc[-21] approximates four trading weeks ago; iloc[0] approximates
       52 weeks ago. Period '2d' was sufficient when only the day change was
       shown — '1y' is required now that comparative context is included.
+
     WHY FTSE 250 alongside FTSE 100:
       The FTSE 100 tracks large-cap internationally exposed companies —
       it tells you what global markets are doing as much as the UK.
       The FTSE 250 is predominantly domestic mid-cap — a better proxy for
       the health of the UK economy itself. When the two diverge, the
       divergence is the story. Leo can name it when it is worth naming.
+
     WHY is_evening:
       At 19:00 BST, FTSE has closed (16:30 BST) but US markets are still
       live. Showing partial US figures would be misleading. When
       is_evening=True, only FTSE 100 is fetched for the close line.
+
     WHY float() conversion:
       yfinance returns numpy float64 values. Converting to Python float
       avoids serialisation issues if the dict is ever logged as JSON.
@@ -251,10 +267,7 @@ def _fetch_market_data(is_evening: bool = False) -> dict | None:
             if hist.empty:
                 logging.warning(f"digest_shared: no history returned for {symbol}")
                 continue
-
             close = float(hist["Close"].iloc[-1])
-
-            # Day-over-day change
             if len(hist) >= 2:
                 prev_close = float(hist["Close"].iloc[-2])
                 change     = close - prev_close
@@ -262,21 +275,16 @@ def _fetch_market_data(is_evening: bool = False) -> dict | None:
             else:
                 change     = 0.0
                 change_pct = 0.0
-
-            # Four-week comparative (~20 trading days)
             four_week_pct = None
             if len(hist) >= 21:
                 four_week_close = float(hist["Close"].iloc[-21])
                 if four_week_close:
                     four_week_pct = ((close - four_week_close) / four_week_close) * 100
-
-            # 52-week comparative (oldest available data in 1y window)
             year_pct = None
-            if len(hist) >= 50:  # Guard against thin data sets
+            if len(hist) >= 50:
                 year_close = float(hist["Close"].iloc[0])
                 if year_close:
                     year_pct = ((close - year_close) / year_close) * 100
-
             results[key] = {
                 "close":         close,
                 "change":        change,
@@ -287,22 +295,25 @@ def _fetch_market_data(is_evening: bool = False) -> dict | None:
         except Exception as e:
             logging.warning(f"digest_shared: market fetch failed for {symbol} — {e}")
             continue
-
     return results if results else None
 
 
 def _market_voice_line(market_data: dict, is_monday: bool) -> str:
     """
     Return a single Leo-voice sentence interpreting market direction.
+
     WHY a sentence rather than numbers:
       Leo briefs direction first. The numbers sit below as supporting
       detail. Reading out a ticker is not Leo's register.
+
     WHY is_monday:
       On Monday morning the most recent session was Friday. 'Overnight'
       would be inaccurate. 'On Friday' is precise.
+
     WHY S&P 500 as the US proxy:
       The S&P is the broadest US index and the one most commonly
       referenced in a leadership context.
+
     WHY FTSE 100 as the UK proxy, not FTSE 250:
       The voice line is directional shorthand. The FTSE 100 is the
       recognised headline index. The 250's comparative story is told
@@ -311,10 +322,8 @@ def _market_voice_line(market_data: dict, is_monday: bool) -> str:
     time_ref = "on Friday" if is_monday else "overnight"
     ftse  = market_data.get("ftse")
     sp500 = market_data.get("sp500")
-
     if not ftse and not sp500:
         return ""
-
     if ftse and sp500:
         ftse_up = ftse["change_pct"] >= 0
         sp_up   = sp500["change_pct"] >= 0
@@ -326,33 +335,34 @@ def _market_voice_line(market_data: dict, is_monday: bool) -> str:
             return f"Wall Street closed higher {time_ref}. London finished down."
         else:
             return f"Wall Street finished lower {time_ref}. London closed in the green."
-
     if ftse:
         direction = "higher" if ftse["change_pct"] >= 0 else "lower"
         return f"London closed {direction} {time_ref}."
-
     return ""
 
 
 def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
     """
     Build Adaptive Card body items for the markets section.
+
     WHY voice_line first, then numbers:
       Leo interprets direction in one sentence; the index rows are the
       evidence beneath it. Conclusion first, supporting detail below.
+
     WHY ▲/▼ with Good/Attention colour:
       Direction is immediately legible without arithmetic. Green/red is
       the universal market convention.
+
     WHY comparative context shown as subtitle beneath each index:
       4W and 1Y percentages give the number a frame of reference without
       adding a separate card or section. A number in isolation tells you
       where something is; the comparatives tell you whether that matters.
+
     WHY thousands separator, no decimals for large indices:
       FTSE and Dow trade above 1,000 — decimal places add noise without
       value at a briefing level.
     """
     items: list[dict] = []
-
     if voice_line:
         items.append({
             "type": "TextBlock",
@@ -362,7 +372,6 @@ def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
             "wrap": True,
             "spacing": "None",
         })
-
     index_labels = {
         "ftse":    "FTSE 100",
         "ftse250": "FTSE 250",
@@ -370,12 +379,10 @@ def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
         "dow":     "Dow Jones",
         "nasdaq":  "NASDAQ",
     }
-
     for key, label in index_labels.items():
         entry = market_data.get(key)
         if not entry:
             continue
-
         close      = entry["close"]
         change_pct = entry["change_pct"]
         up         = change_pct >= 0
@@ -383,8 +390,6 @@ def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
         colour     = "Good" if up else "Attention"
         close_str  = f"{close:,.0f}" if close >= 1000 else f"{close:,.2f}"
         change_str = f"{arrow} {abs(change_pct):.2f}%"
-
-        # Comparative context subtitle
         comp_parts = []
         if entry.get("four_week_pct") is not None:
             fw = entry["four_week_pct"]
@@ -395,8 +400,6 @@ def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
             yr_arrow = "▲" if yr >= 0 else "▼"
             comp_parts.append(f"1Y {yr_arrow}{abs(yr):.1f}%")
         comp_line = "  |  ".join(comp_parts) if comp_parts else None
-
-        # Label column items: index name + optional comparative line
         label_items: list[dict] = [
             {
                 "type": "TextBlock",
@@ -413,7 +416,6 @@ def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
                 "isSubtle": True,
                 "spacing": "None",
             })
-
         items.append({
             "type": "ColumnSet",
             "spacing": "Small",
@@ -451,13 +453,13 @@ def _build_market_items(market_data: dict, voice_line: str) -> list[dict]:
                 },
             ],
         })
-
     return items
 
 
 def _evening_ftse_line(ftse: dict) -> str:
     """
     Build the single FTSE 100 close line for the 19:00 card header.
+
     WHY direction word rather than just a number:
       Leo's voice leads with interpretation. 'London closed higher today'
       is the briefing; the number is the supporting detail. Both appear
@@ -469,19 +471,22 @@ def _evening_ftse_line(ftse: dict) -> str:
     change_str = f"{arrow} {abs(ftse['change_pct']):.2f}%"
     return f"London closed {direction} today.  FTSE {close_str}  {change_str}"
 
-# ── Calendar fetching ──────────────────────────────────────────────────────────
 
+# ── Calendar fetching ──────────────────────────────────────────────────────────
 def _fetch_calendar_events(
     token: str, now_utc: datetime, day_offset: int = 0
 ) -> list[dict]:
     """
     Fetch calendar events for a given day from Microsoft Graph.
+
     WHY day_offset:
       day_offset=0 returns today's events (default).
       day_offset=1 returns tomorrow's — used by the 19:00 closing card.
+
     WHY calendarView rather than /events with a filter:
       calendarView automatically expands recurring events into individual
       instances. A filter on /events returns only the series master.
+
     WHY filter yesterday's all-day events after fetching:
       Graph's calendarView startDateTime is inclusive. An all-day event
       from the previous day ends exactly at the query start — so Graph
@@ -496,7 +501,6 @@ def _fetch_calendar_events(
     day_end   = day_start + timedelta(days=1)
     start_str = day_start.strftime("%Y-%m-%dT%H:%M:%S")
     end_str   = day_end.strftime("%Y-%m-%dT%H:%M:%S")
-
     url = (
         "https://graph.microsoft.com/v1.0/users/"
         "cda66539-6f2a-4a27-a5a3-a493061f8711"
@@ -514,10 +518,8 @@ def _fetch_calendar_events(
     resp.raise_for_status()
     data   = resp.json()
     events = data.get("value", [])
-
     if data.get("@odata.nextLink"):
         logging.warning("digest_shared: more than 20 events — some omitted")
-
     today_date_str = day_start.strftime("%Y-%m-%d")
     filtered = []
     for event in events:
@@ -530,14 +532,14 @@ def _fetch_calendar_events(
                 )
                 continue
         filtered.append(event)
-
     return filtered
 
-# ── Event items helper ─────────────────────────────────────────────────────────
 
+# ── Event items helper ─────────────────────────────────────────────────────────
 def _build_event_items(events: list[dict]) -> list[dict]:
     """
     Build Adaptive Card body items for a list of calendar events.
+
     WHY extracted as a helper:
       Both _build_morning_briefing_card and _build_agenda_card render
       calendar events. One source of truth — a change applies everywhere.
@@ -550,7 +552,6 @@ def _build_event_items(events: list[dict]) -> list[dict]:
             "wrap": True,
             "spacing": "Small",
         }]
-
     items = []
     for i, event in enumerate(events):
         if event.get("isAllDay"):
@@ -566,10 +567,8 @@ def _build_event_items(events: list[dict]) -> list[dict]:
                 time_str = f"{start_dt.strftime('%H:%M')}–{end_dt.strftime('%H:%M')}"
             except Exception:
                 time_str = ""
-
         subject  = (event.get("subject") or "No title").strip()
         location = (event.get("location", {}).get("displayName", "") or "").strip()
-
         organiser_email = (
             event.get("organizer", {})
                  .get("emailAddress", {})
@@ -585,7 +584,6 @@ def _build_event_items(events: list[dict]) -> list[dict]:
                  .get("emailAddress", {})
                  .get("name", "")
         )
-
         items.append({
             "type": "ColumnSet",
             "spacing": "Small" if i == 0 else "Medium",
@@ -637,11 +635,10 @@ def _build_event_items(events: list[dict]) -> list[dict]:
                 },
             ],
         })
-
     return items
 
-# ── Agenda card builder ────────────────────────────────────────────────────────
 
+# ── Agenda card builder ────────────────────────────────────────────────────────
 def _build_agenda_card(
     events: list[dict],
     now_london: datetime,
@@ -651,6 +648,7 @@ def _build_agenda_card(
 ) -> dict:
     """
     Build an agenda Adaptive Card for any given day.
+
     WHY label and intro parameters:
       label changes the card header (TODAY vs TOMORROW).
       intro adds an opening line before the event list — used for the
@@ -658,7 +656,6 @@ def _build_agenda_card(
     """
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
     container_items: list[dict] = []
-
     if intro:
         container_items.append({
             "type": "TextBlock",
@@ -667,7 +664,6 @@ def _build_agenda_card(
             "wrap": True,
             "spacing": "None",
         })
-
     container_items += [
         {
             "type": "TextBlock",
@@ -691,7 +687,6 @@ def _build_agenda_card(
         },
     ]
     container_items.extend(_build_event_items(events))
-
     return {
         "type": "AdaptiveCard",
         "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
@@ -704,11 +699,12 @@ def _build_agenda_card(
         }],
     }
 
-# ── Email fetching ─────────────────────────────────────────────────────────────
 
+# ── Email fetching ─────────────────────────────────────────────────────────────
 def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     """
     Fetch emails from the Inbox received after `since`.
+
     WHY $filter on receivedDateTime: Graph filters server-side.
     WHY top=100: a 2-hour window on a busy inbox can exceed 50 items.
     WHY fallback to 2 hours when since is None:
@@ -716,13 +712,11 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
       a flood of historical mail on first use.
     """
     headers = {"Authorization": f"Bearer {token}"}
-
     if since:
         since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     else:
         two_hours_ago = datetime.now(timezone.utc) - timedelta(hours=2)
         since_str     = two_hours_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     url = (
         "https://graph.microsoft.com/v1.0/users/"
         "cda66539-6f2a-4a27-a5a3-a493061f8711"
@@ -736,24 +730,22 @@ def _fetch_emails(token: str, since: datetime | None) -> list[dict]:
     resp.raise_for_status()
     data   = resp.json()
     emails = data.get("value", [])
-
     if data.get("@odata.nextLink"):
         logging.warning("digest_shared: more than 100 emails in window — some omitted")
-
     return emails
 
-# ── Sender photo resolution ────────────────────────────────────────────────────
 
+# ── Sender photo resolution ────────────────────────────────────────────────────
 def _get_sender_photo(token: str, sender_email: str) -> str:
     """
     Resolve a sender's profile photo to a base64 data URI.
     Resolution order: internal M365 user photo → saved contact photo → envelope fallback.
+
     WHY base64 data URI:
       Adaptive Cards in Teams do not reliably render Graph-authenticated
       image URLs. Embedding as base64 removes the auth dependency entirely.
     """
     headers = {"Authorization": f"Bearer {token}"}
-
     try:
         resp = requests.get(
             f"https://graph.microsoft.com/v1.0/users/{sender_email}/photo/$value",
@@ -765,7 +757,6 @@ def _get_sender_photo(token: str, sender_email: str) -> str:
             return f"data:image/jpeg;base64,{encoded}"
     except Exception as e:
         logging.debug(f"digest_shared: internal photo lookup failed — {e}")
-
     try:
         search_resp = requests.get(
             "https://graph.microsoft.com/v1.0/me/contacts"
@@ -789,11 +780,10 @@ def _get_sender_photo(token: str, sender_email: str) -> str:
                     return f"data:image/jpeg;base64,{encoded}"
     except Exception as e:
         logging.debug(f"digest_shared: contact photo lookup failed — {e}")
-
     return ENVELOPE_ICON
 
-# ── Blob Storage helpers ───────────────────────────────────────────────────────
 
+# ── Blob Storage helpers ───────────────────────────────────────────────────────
 def _get_blob_client():
     conn_str = os.environ["AzureWebJobsStorage"]
     service  = BlobServiceClient.from_connection_string(conn_str)
@@ -823,23 +813,25 @@ def _write_last_run(timestamp: datetime) -> None:
     except Exception as e:
         logging.error(f"digest_shared: failed to write last_run blob — {e}")
 
-# ── Time formatting helper ─────────────────────────────────────────────────────
 
+# ── Time formatting helper ─────────────────────────────────────────────────────
 def _fmt_time(dt: datetime, tz_label: str) -> str:
     local = dt.astimezone(LONDON_TZ)
     return local.strftime(f"%H:%M {tz_label} on %a %d %b")
 
-# ── Leo voice helpers ──────────────────────────────────────────────────────────
 
+# ── Leo voice helpers ──────────────────────────────────────────────────────────
 def _greeting(hour: int) -> str:
     """
     Return the correct Leo-voice greeting for the given hour.
+
     WHY simplified from original:
       Previously took an is_first_slot parameter to handle Sunday 07:00
       being treated as the first slot. Sunday now starts at 05:00 like
       all other days (Session 33 decision). The 05:00 slot file never
       calls _greeting() — the morning briefing card has its own hardcoded
       greeting. This function is called only by the 07:00–19:00 slot files.
+
     WHY alternating Phillip and Sir:
       Reflects the register variation in Leo's voice profile. Neither form
       of address becomes monotonous across the day.
@@ -859,12 +851,15 @@ def _greeting(hour: int) -> str:
 def _email_count_line(count: int) -> str:
     """
     Return a Leo-voice email count line.
+
     WHY short declaratives:
       Short declaratives — 'Four emails to work through.' — match the
       character profile. Leo does not pad.
+
     WHY number words up to twelve, then digits:
       Written numbers read more naturally in a conversational context.
       Above twelve, digits are clearer.
+
     WHY random choice for zero:
       Two equivalent phrasings for an empty inbox avoid the same line
       appearing every quiet morning.
@@ -881,8 +876,8 @@ def _email_count_line(count: int) -> str:
         return "One email."
     return f"{word} emails to work through."
 
-# ── Morning briefing card builder ──────────────────────────────────────────────
 
+# ── Morning briefing card builder ──────────────────────────────────────────────
 def _build_morning_briefing_card(
     weather: dict | None,
     events: list[dict],
@@ -893,20 +888,22 @@ def _build_morning_briefing_card(
 ) -> dict:
     """
     Build the unified first-slot card: greeting + markets + weather + agenda.
+
     WHY markets before weather:
       Natural CoS briefing order: overnight context (markets), today's
       conditions (weather), today's commitments (agenda). Leo gives Phillip
       what happened while he slept before telling him what the day will feel like.
+
     WHY market_data is conditional:
       If yfinance fails, the card renders without the markets section.
       A morning without market data is better than no morning card.
+
     WHY greeting is two TextBlocks:
       'Good morning, Sir.' is the address — large and immediate.
       'Here's the day.' is the handover — one size smaller. Each phrase
       has its own visual weight without requiring a separate card.
     """
     date_str = now_london.strftime(f"%A %d %B — {tz_label}")
-
     items: list[dict] = [
         {
             "type": "TextBlock",
@@ -934,8 +931,6 @@ def _build_morning_briefing_card(
             "spacing": "None",
         },
     ]
-
-    # ── Markets section ───────────────────────────────────────────────────────
     if market_data:
         voice_line   = _market_voice_line(market_data, is_monday)
         market_items = _build_market_items(market_data, voice_line)
@@ -954,12 +949,9 @@ def _build_morning_briefing_card(
                 "spacing": "None",
             })
             items.extend(market_items)
-
-    # ── Weather section ───────────────────────────────────────────────────────
     if weather:
         today    = weather["today"]
         forecast = weather["forecast"]
-
         items.append({
             "type": "TextBlock",
             "text": "─────────────────────",
@@ -1021,7 +1013,6 @@ def _build_morning_briefing_card(
                 },
             ],
         })
-
         forecast_columns = []
         for day in forecast:
             dt       = datetime.strptime(day["date"], "%Y-%m-%d")
@@ -1070,8 +1061,6 @@ def _build_morning_briefing_card(
             "spacing": "Small",
         })
         items.append({"type": "ColumnSet", "spacing": "Small", "columns": forecast_columns})
-
-    # ── Agenda section ────────────────────────────────────────────────────────
     items.append({
         "type": "TextBlock",
         "text": "─────────────────────",
@@ -1086,7 +1075,6 @@ def _build_morning_briefing_card(
         "spacing": "None",
     })
     items.extend(_build_event_items(events))
-
     return {
         "type": "AdaptiveCard",
         "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
@@ -1099,8 +1087,8 @@ def _build_morning_briefing_card(
         }],
     }
 
-# ── Clear inbox card builder ───────────────────────────────────────────────────
 
+# ── Clear inbox card builder ───────────────────────────────────────────────────
 def _build_clear_inbox_card(
     greeting: str | None,
     count_line: str,
@@ -1108,18 +1096,20 @@ def _build_clear_inbox_card(
 ) -> dict:
     """
     Build a minimal card for slots where the inbox is empty.
+
     WHY send a card rather than nothing:
       Leo checks in at every slot. A card confirms the digest ran and
       the inbox is genuinely empty. Silence is ambiguous.
+
     WHY greeting is optional:
       At 05:00, the greeting is already in the morning briefing card.
       Passing greeting=None omits it here to avoid a second
       'Good morning, Sir.' in the channel.
+
     WHY market_line is optional:
       Only the 19:00 slot passes the FTSE close line.
     """
     items: list[dict] = []
-
     if greeting:
         items.append({
             "type": "TextBlock",
@@ -1129,7 +1119,6 @@ def _build_clear_inbox_card(
             "color": "Warning",
             "spacing": "None",
         })
-
     if market_line:
         items.append({
             "type": "TextBlock",
@@ -1139,7 +1128,6 @@ def _build_clear_inbox_card(
             "wrap": True,
             "spacing": "Small" if greeting else "None",
         })
-
     items.append({
         "type": "TextBlock",
         "text": count_line,
@@ -1147,7 +1135,6 @@ def _build_clear_inbox_card(
         "wrap": True,
         "spacing": "Small" if (greeting or market_line) else "None",
     })
-
     return {
         "type": "AdaptiveCard",
         "$schema": "https://adaptivecards.io/schemas/adaptive-card.json",
@@ -1160,14 +1147,16 @@ def _build_clear_inbox_card(
         }],
     }
 
-# ── Goodnight card builder ─────────────────────────────────────────────────────
 
+# ── Goodnight card builder ─────────────────────────────────────────────────────
 def _build_goodnight_card() -> dict:
     """
     Build the end-of-day closing card sent at 19:00.
+
     WHY a dedicated card:
       Leo closes the day as he would leave the Oval Office — 'Good night,
       Sir.' It is the last thing in the channel each day.
+
     WHY Large rather than ExtraLarge:
       The goodnight card closes the day — settled and calm rather than loud.
     """
@@ -1190,8 +1179,8 @@ def _build_goodnight_card() -> dict:
         }],
     }
 
-# ── Concertina email card builder ──────────────────────────────────────────────
 
+# ── Concertina email card builder ──────────────────────────────────────────────
 def _build_concertina_card(
     emails: list[dict],
     tz_label: str,
@@ -1203,27 +1192,39 @@ def _build_concertina_card(
 ) -> dict:
     """
     Build a single Adaptive Card containing all emails as collapsible rows.
+
     WHY concertina rather than one card per email:
       A single card with all emails collapsed means the full inbox is
       visible at a glance. Phillip expands only the email he is triaging.
+
     WHY greeting and count_line parameters:
       At 05:00, greeting=None — the greeting is already in the morning card.
       At all other slots, the greeting appears at the top of the header.
       count_line always sits immediately above the emails it describes.
+
     WHY market_line is optional:
       Only the 19:00 slot passes the FTSE close.
+
     WHY two ActionSet blocks rather than one:
       A single ActionSet with four buttons wraps as 3+1 on mobile.
       Splitting into two blocks of two forces a consistent 2+2 layout.
+
     WHY Action.ToggleVisibility:
       Native Adaptive Card mechanism for show/hide without a backend
       round-trip. The toggle fires client-side in Teams — instant.
+
+    WHY urllib.parse.quote for the View button URL:
+      Graph message IDs are long base64-style strings containing
+      characters (=, /, +) that are not safe in a URL path segment.
+      quote(email_id, safe='') percent-encodes every special character
+      so the Outlook deep link is a valid URL. safe='' is required —
+      without it, / would be left unencoded and would corrupt the path.
+      The resulting URL opens the specific message directly in Outlook
+      on the web, bypassing the inbox list entirely.
     """
     date_str = now_london.strftime(f"%A %d %B %Y — %H:%M {tz_label}")
 
-    # ── Card header ───────────────────────────────────────────────────────────
     header_items: list[dict] = []
-
     if greeting:
         header_items.append({
             "type": "TextBlock",
@@ -1233,7 +1234,6 @@ def _build_concertina_card(
             "color": "Warning",
             "spacing": "None",
         })
-
     if market_line:
         header_items.append({
             "type": "TextBlock",
@@ -1243,7 +1243,6 @@ def _build_concertina_card(
             "wrap": True,
             "spacing": "Small" if greeting else "None",
         })
-
     header_items.append({
         "type": "TextBlock",
         "text": count_line,
@@ -1251,11 +1250,7 @@ def _build_concertina_card(
         "wrap": True,
         "spacing": "Small" if (greeting or market_line) else "None",
     })
-
     if not greeting:
-        # WHY EMAIL TRIAGE label only when there is no greeting:
-        #   When there is no greeting (05:00, greeting already delivered),
-        #   a label anchors the card.
         header_items.insert(0, {
             "type": "TextBlock",
             "text": "📧 EMAIL TRIAGE",
@@ -1263,7 +1258,6 @@ def _build_concertina_card(
             "color": "Warning",
             "spacing": "None",
         })
-
     header_items.append({
         "type": "TextBlock",
         "text": date_str,
@@ -1271,7 +1265,6 @@ def _build_concertina_card(
         "size": "Small",
         "spacing": "None",
     })
-
     body: list[dict] = [{
         "type": "Container",
         "style": "emphasis",
@@ -1279,7 +1272,6 @@ def _build_concertina_card(
         "items": header_items,
     }]
 
-    # ── Email rows ────────────────────────────────────────────────────────────
     for i, email in enumerate(emails):
         sender_name  = (
             email.get("from", {}).get("emailAddress", {}).get("name", "Unknown")
@@ -1307,6 +1299,13 @@ def _build_concertina_card(
             _get_sender_photo(token, sender_addr) if sender_addr else ENVELOPE_ICON
         )
 
+        # WHY urllib.parse.quote:
+        #   The Graph message ID contains characters unsafe in a URL path.
+        #   Encoding it produces a valid Outlook on the web deep link that
+        #   opens this specific message rather than the inbox root.
+        encoded_id = urllib.parse.quote(email_id, safe="")
+        view_url   = f"https://outlook.office365.com/mail/id/{encoded_id}"
+
         if i > 0:
             body.append({
                 "type": "TextBlock",
@@ -1316,7 +1315,6 @@ def _build_concertina_card(
                 "size": "Small",
             })
 
-        # ── Collapsed summary row ─────────────────────────────────────────────
         body.append({
             "type": "Container",
             "spacing": "Small",
@@ -1377,7 +1375,6 @@ def _build_concertina_card(
             }],
         })
 
-        # ── Expanded detail section ───────────────────────────────────────────
         body.append({
             "type": "Container",
             "id": detail_id,
@@ -1451,7 +1448,7 @@ def _build_concertina_card(
                             "type": "Action.OpenUrl",
                             "title": "View",
                             "style": "default",
-                            "url": "https://outlook.office365.com/mail/",
+                            "url": view_url,
                         },
                         {
                             "type": "Action.Submit",
@@ -1471,8 +1468,8 @@ def _build_concertina_card(
         "body": body,
     }
 
-# ── Teams delivery ─────────────────────────────────────────────────────────────
 
+# ── Teams delivery ─────────────────────────────────────────────────────────────
 def _get_delivery_config() -> tuple[str, str, str, str]:
     bot_token   = _get_bot_token()
     service_url = os.environ["TEAMS_SERVICE_URL"].rstrip("/")
