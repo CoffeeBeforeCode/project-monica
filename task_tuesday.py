@@ -1,4 +1,3 @@
-# task_tuesday.py
 import azure.functions as func
 import logging
 import os
@@ -8,9 +7,10 @@ from zoneinfo import ZoneInfo
 
 bp = func.Blueprint()
 
-USER_ID      = "cda66539-6f2a-4a27-a5a3-a493061f8711"
-HOME_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
-LONDON_TZ    = ZoneInfo("Europe/London")
+USER_ID       = "cda66539-6f2a-4a27-a5a3-a493061f8711"
+HOME_LIST_ID  = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
+ADMIN_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA="
+LONDON_TZ     = ZoneInfo("Europe/London")
 
 
 def get_access_token() -> str | None:
@@ -74,9 +74,14 @@ def today_london_at(hour: int, minute: int = 0) -> datetime:
 def createTuesdayTasks(timer: func.TimerRequest) -> None:
     """
     Why: Fires every Tuesday at 05:00 London local time. Beige Tuesday laundry.
+    LinkedIn and Upwork are due at 09:00 so they surface at the start of
+    the working day rather than alongside the household task at 05:00.
     """
     logging.info("createTuesdayTasks fired")
     token = get_access_token()
     if not token:
         return
-    create_todo_task(token, HOME_LIST_ID, "Wash: Beige Tuesday", "[00] System", due_utc=today_london_at(5, 0))
+
+    create_todo_task(token, HOME_LIST_ID,  "Wash: Beige Tuesday", "[00] System", due_utc=today_london_at(5, 0))
+    create_todo_task(token, ADMIN_LIST_ID, "Check: LinkedIn",     "[02] Work",   due_utc=today_london_at(9, 0))
+    create_todo_task(token, ADMIN_LIST_ID, "Prospect: Upwork",    "[02] Work",   due_utc=today_london_at(9, 0))
