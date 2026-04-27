@@ -73,12 +73,35 @@ def today_london_at(hour: int, minute: int = 0) -> datetime:
 )
 def createFridayTasks(timer: func.TimerRequest) -> None:
     """
-    Why: Fires every Friday at 05:00 London local time. Weekly vacuum with a
-    09:00 London reminder, plus alternating Bath Towels and Bedding washes on
-    a fortnightly cycle each. NCRONTAB cannot express alternating weeks so the
-    cycles are calculated in code from fixed start dates.
-    LinkedIn and Upwork are due at 09:00 so they surface at the start of
-    the working day rather than alongside the household tasks at 05:00.
+    Why: Fires every Friday at 05:00 London local time.
+
+    Weekly tasks (every Friday):
+      - Vacuum: through and dust (09:00 reminder)
+      - Place: Black Bin outside
+      - Place: Food Bin outside
+      - Sweep: Curb
+      - Empty: Bins
+      - Check: LinkedIn / Prospect: Upwork
+
+    Fortnightly Cycle A (from 1 May 2026):
+      - Place: Brown Bin outside
+      - Wash: Bedding
+
+    Fortnightly Cycle B (from 8 May 2026):
+      - Place: Green Bin outside
+      - Place: Bottle Bin outside
+      - Change: Bedding
+      - Wash: AJC's Bath Towels
+      - Wash: PJC's Bath Towel
+
+    Why two separate fortnightly cycles rather than one:
+      The bin collection and laundry schedules alternate on opposite weeks.
+      NCRONTAB cannot express fortnightly patterns so the week is
+      calculated in code from fixed start dates. weeks_since % 2 == 0
+      identifies Cycle A weeks; % 2 == 1 identifies Cycle B weeks.
+      Both cycles begin from their respective first occurrence dates —
+      if now is before the start date (weeks_since < 0) neither fires,
+      which prevents spurious tasks before the schedule begins.
     """
     logging.info("createFridayTasks fired")
     token = get_access_token()
@@ -90,19 +113,37 @@ def createFridayTasks(timer: func.TimerRequest) -> None:
     workhour = today_london_at(9, 0)
     reminder = today_london_at(9, 0)
 
-    create_todo_task(token, HOME_LIST_ID, "Vacuum: through and dust", "[00] System", due_utc=morning, reminder_utc=reminder)
+    # ── Weekly tasks — every Friday ───────────────────────────────────────────
+    create_todo_task(token, HOME_LIST_ID,  "Vacuum: through and dust", "[00] System", due_utc=morning, reminder_utc=reminder)
+    create_todo_task(token, HOME_LIST_ID,  "Place: Black Bin outside", "[00] System", due_utc=morning)
+    create_todo_task(token, HOME_LIST_ID,  "Place: Food Bin outside",  "[00] System", due_utc=morning)
+    create_todo_task(token, HOME_LIST_ID,  "Sweep: Curb",              "[00] System", due_utc=morning)
+    create_todo_task(token, HOME_LIST_ID,  "Empty: Bins",              "[00] System", due_utc=morning)
 
-    # Bath Towels: every 2nd Friday from 27 Feb 2026
-    bath_towels_start = datetime(2026, 2, 27, tzinfo=timezone.utc)
-    weeks_since_bath  = (now - bath_towels_start).days // 7
-    if weeks_since_bath >= 0 and weeks_since_bath % 2 == 0:
-        create_todo_task(token, HOME_LIST_ID, "Wash: Bath Towels", "[00] System", due_utc=morning)
+    # ── Fortnightly cycle calculation ─────────────────────────────────────────
+    # Why datetime(2026, 5, 1): Cycle A begins on the first occurrence date.
+    # Cycle B begins exactly one week later. weeks_since counts complete
+    # 7-day periods elapsed since the cycle start — integer division
+    # ensures a partial week does not advance the counter prematurely.
+    cycle_a_start = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    weeks_since   = (now - cycle_a_start).days // 7
 
-    # Bedding: every 2nd Friday from 06 Mar 2026
-    bedding_start       = datetime(2026, 3, 6, tzinfo=timezone.utc)
-    weeks_since_bedding = (now - bedding_start).days // 7
-    if weeks_since_bedding >= 0 and weeks_since_bedding % 2 == 0:
-        create_todo_task(token, HOME_LIST_ID, "Wash: Bedding", "[00] System", due_utc=morning)
+    is_cycle_a = weeks_since >= 0 and weeks_since % 2 == 0
+    is_cycle_b = weeks_since >= 0 and weeks_since % 2 == 1
 
+    # ── Cycle A tasks ─────────────────────────────────────────────────────────
+    if is_cycle_a:
+        create_todo_task(token, HOME_LIST_ID, "Place: Brown Bin outside", "[00] System", due_utc=morning)
+        create_todo_task(token, HOME_LIST_ID, "Wash: Bedding",            "[00] System", due_utc=morning)
+
+    # ── Cycle B tasks ─────────────────────────────────────────────────────────
+    if is_cycle_b:
+        create_todo_task(token, HOME_LIST_ID, "Place: Green Bin outside",  "[00] System", due_utc=morning)
+        create_todo_task(token, HOME_LIST_ID, "Place: Bottle Bin outside", "[00] System", due_utc=morning)
+        create_todo_task(token, HOME_LIST_ID, "Change: Bedding",           "[00] System", due_utc=morning)
+        create_todo_task(token, HOME_LIST_ID, "Wash: AJC's Bath Towels",   "[00] System", due_utc=morning)
+        create_todo_task(token, HOME_LIST_ID, "Wash: PJC's Bath Towel",    "[00] System", due_utc=morning)
+
+    # ── Work tasks ────────────────────────────────────────────────────────────
     create_todo_task(token, ADMIN_LIST_ID, "Check: LinkedIn",  "[02] Work", due_utc=workhour)
     create_todo_task(token, ADMIN_LIST_ID, "Prospect: Upwork", "[02] Work", due_utc=workhour)
