@@ -1,4 +1,3 @@
-# task_friday.py
 import azure.functions as func
 import logging
 import os
@@ -8,9 +7,10 @@ from zoneinfo import ZoneInfo
 
 bp = func.Blueprint()
 
-USER_ID      = "cda66539-6f2a-4a27-a5a3-a493061f8711"
-HOME_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
-LONDON_TZ    = ZoneInfo("Europe/London")
+USER_ID       = "cda66539-6f2a-4a27-a5a3-a493061f8711"
+HOME_LIST_ID  = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBLAAA="
+ADMIN_LIST_ID = "AAMkADk2MmYyN2U1LWRjZWQtNDJjOC1hMjFiLThlNzVjYzRmMDJmOQAuAAAAAAAfD4se_DbiSLJ1kLVyFgjcAQDiRt3FrJvhSa6XMQrXYM-wAAG5bJBKAAA="
+LONDON_TZ     = ZoneInfo("Europe/London")
 
 
 def get_access_token() -> str | None:
@@ -77,6 +77,8 @@ def createFridayTasks(timer: func.TimerRequest) -> None:
     09:00 London reminder, plus alternating Bath Towels and Bedding washes on
     a fortnightly cycle each. NCRONTAB cannot express alternating weeks so the
     cycles are calculated in code from fixed start dates.
+    LinkedIn and Upwork are due at 09:00 so they surface at the start of
+    the working day rather than alongside the household tasks at 05:00.
     """
     logging.info("createFridayTasks fired")
     token = get_access_token()
@@ -85,6 +87,7 @@ def createFridayTasks(timer: func.TimerRequest) -> None:
 
     now      = datetime.now(timezone.utc)
     morning  = today_london_at(5, 0)
+    workhour = today_london_at(9, 0)
     reminder = today_london_at(9, 0)
 
     create_todo_task(token, HOME_LIST_ID, "Vacuum: through and dust", "[00] System", due_utc=morning, reminder_utc=reminder)
@@ -100,3 +103,6 @@ def createFridayTasks(timer: func.TimerRequest) -> None:
     weeks_since_bedding = (now - bedding_start).days // 7
     if weeks_since_bedding >= 0 and weeks_since_bedding % 2 == 0:
         create_todo_task(token, HOME_LIST_ID, "Wash: Bedding", "[00] System", due_utc=morning)
+
+    create_todo_task(token, ADMIN_LIST_ID, "Check: LinkedIn",  "[02] Work", due_utc=workhour)
+    create_todo_task(token, ADMIN_LIST_ID, "Prospect: Upwork", "[02] Work", due_utc=workhour)
