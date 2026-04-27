@@ -1,4 +1,3 @@
-# task_sunday.py
 import azure.functions as func
 import logging
 import os
@@ -73,12 +72,18 @@ def today_london_at(hour: int, minute: int = 0) -> datetime:
 )
 def createSundayTasks(timer: func.TimerRequest) -> None:
     """
-    Why: Sunday napkins wash fires at 17:00 London local time — same logic as
-    the evening pill. A Sunday morning trigger would fire before the napkins
-    from the previous week's dinner are ready to wash.
+    Why: Fires every Sunday at 17:00 London local time.
+    Wash: Napkins — fires in the evening so napkins from the previous
+    week's dinner are ready to wash.
+    Change: Tea Towel — part of the every-other-day tea towel rotation
+    across Tuesday, Thursday, Saturday, and Sunday evenings.
     """
     logging.info("createSundayTasks fired")
     token = get_access_token()
     if not token:
         return
-    create_todo_task(token, HOME_LIST_ID, "Wash: Napkins", "[00] System", due_utc=today_london_at(17, 0))
+
+    evening = today_london_at(17, 0)
+
+    create_todo_task(token, HOME_LIST_ID, "Wash: Napkins",      "[00] System", due_utc=evening)
+    create_todo_task(token, HOME_LIST_ID, "Change: Tea Towel",  "[00] System", due_utc=evening)
