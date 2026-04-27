@@ -11,45 +11,56 @@ WHY this file exists:
   crashes only that Blueprint. If this file itself crashes, all functions
   go down — so it must stay simple and free of logic.
 
-Current function inventory (22 timer triggers + 3 HTTP triggers = 25 total):
-  File                       Function                    Type
-  ───────────────────────────────────────────────────────────────────────────
-  function_app.py            ping                        HTTP Trigger
-  task_chain.py              taskChain                   HTTP Trigger
-  messages.py                messages                    HTTP Trigger
-  pre_warm.py                preWarm                     Timer — daily 04:45
-  email_digest_0500.py       emailDigest0500             Timer — daily 05:00
-  email_digest_0700.py       emailDigest0700             Timer — daily 07:00
-  email_digest_0900.py       emailDigest0900             Timer — daily 09:00
-  email_digest_1100.py       emailDigest1100             Timer — daily 11:00
-  email_digest_1300.py       emailDigest1300             Timer — daily 13:00
-  email_digest_1500.py       emailDigest1500             Timer — daily 15:00
-  email_digest_1700.py       emailDigest1700             Timer — daily 17:00
-  email_digest_1900.py       emailDigest1900             Timer — daily 19:00
-  webhook_renewal.py         renewWebhookSubscriptions   Timer — daily 07:00
-  task_morning.py            createMorningTasks          Timer — daily 05:00
-  task_evening.py            createEveningTasks          Timer — daily 17:00
-  task_monday.py             createMondayTasks           Timer — Monday 05:00
-  task_monday_evening.py     createMondayEveningTasks    Timer — Monday 17:00
-  task_tuesday.py            createTuesdayTasks          Timer — Tuesday 05:00
-  task_wednesday.py          createWednesdayTasks        Timer — Wednesday 05:00
-  task_wednesday_evening.py  createWednesdayEveningTasks Timer — Wednesday 17:00
-  task_thursday.py           createThursdayTasks         Timer — Thursday 05:00
-  task_friday.py             createFridayTasks           Timer — Friday 05:00
-  task_saturday.py           createSaturdayTasks         Timer — Saturday 17:00
-  task_sunday.py             createSundayTasks           Timer — Sunday 17:00
-  task_monthly.py            createMonthlyTasks          Timer — 1st of month 05:00
-  task_guardian.py           taskGuardian                Timer — daily 08:00
+Current function inventory (24 timer triggers + 3 HTTP triggers = 27 total):
+  File                        Function                     Type
+  ──────────────────────────────────────────────────────────────────────────────
+  function_app.py             ping                         HTTP Trigger
+  task_chain.py               taskChain                    HTTP Trigger
+  messages.py                 messages                     HTTP Trigger
+  pre_warm.py                 preWarm                      Timer — daily 04:45
+  email_digest_0500.py        emailDigest0500              Timer — daily 05:00
+  email_digest_0700.py        emailDigest0700              Timer — daily 07:00
+  email_digest_0900.py        emailDigest0900              Timer — daily 09:00
+  email_digest_1100.py        emailDigest1100              Timer — daily 11:00
+  email_digest_1300.py        emailDigest1300              Timer — daily 13:00
+  email_digest_1500.py        emailDigest1500              Timer — daily 15:00
+  email_digest_1700.py        emailDigest1700              Timer — daily 17:00
+  email_digest_1900.py        emailDigest1900              Timer — daily 19:00
+  webhook_renewal.py          renewWebhookSubscriptions    Timer — daily 07:00
+  task_morning.py             createMorningTasks           Timer — daily 05:00
+  task_evening.py             createEveningTasks           Timer — daily 17:00
+  task_monday.py              createMondayTasks            Timer — Monday 05:00
+  task_monday_evening.py      createMondayEveningTasks     Timer — Monday 17:00
+  task_tuesday.py             createTuesdayTasks           Timer — Tuesday 05:00
+  task_tuesday_evening.py     createTuesdayEveningTasks    Timer — Tuesday 17:00
+  task_wednesday.py           createWednesdayTasks         Timer — Wednesday 05:00
+  task_wednesday_evening.py   createWednesdayEveningTasks  Timer — Wednesday 17:00
+  task_thursday.py            createThursdayTasks          Timer — Thursday 05:00
+  task_thursday_evening.py    createThursdayEveningTasks   Timer — Thursday 17:00
+  task_friday.py              createFridayTasks            Timer — Friday 05:00
+  task_saturday.py            createSaturdayTasks          Timer — Saturday 17:00
+  task_sunday.py              createSundayTasks            Timer — Sunday 17:00
+  task_monthly.py             createMonthlyTasks           Timer — 1st of month 05:00
+  task_guardian.py            taskGuardian                 Timer — daily 08:00
 
   Session 37 changes:
-    task_saturday.py added — Empty: Bins every Saturday at 17:00 London.
+    task_saturday.py added — Empty: Bins and Change: Tea Towel every
+    Saturday at 17:00 London.
     task_monday_evening.py added — Empty: Bins every Monday at 17:00 London.
-    task_wednesday_evening.py added — Empty: Bins every Wednesday at 17:00 London.
-    task_friday.py updated — old Bath Towels/Bedding alternating cycles replaced
-    with new Cycle A (from 1 May 2026) and Cycle B (from 8 May 2026) bin and
-    laundry structure. Weekly bin placement and Sweep: Curb tasks added.
+    task_tuesday_evening.py added — Change: Tea Towel every Tuesday at
+    17:00 London.
+    task_wednesday_evening.py added — Empty: Bins every Wednesday at
+    17:00 London.
+    task_thursday_evening.py added — Change: Tea Towel every Thursday at
+    17:00 London.
+    task_sunday.py updated — Change: Tea Towel added alongside Wash: Napkins.
+    task_friday.py updated — old Bath Towels/Bedding alternating cycles
+    replaced with new Cycle A (from 1 May 2026) and Cycle B (from 8 May 2026)
+    bin and laundry structure. Weekly bin placement and Sweep: Curb added.
     digest_shared.py updated — View button now deep-links to the specific
     email via URL-encoded Graph message ID rather than opening the inbox root.
+    task_monday.py through task_friday.py updated — Check: LinkedIn and
+    Prospect: Upwork added to Admin list at 09:00 on all five weekdays.
 
   Session 34 change:
     pre_warm.py registered as a Blueprint. Previously present in the repo
@@ -99,9 +110,11 @@ from task_evening            import bp as bp_evening
 from task_monday             import bp as bp_monday
 from task_monday_evening     import bp as bp_monday_evening
 from task_tuesday            import bp as bp_tuesday
+from task_tuesday_evening    import bp as bp_tuesday_evening
 from task_wednesday          import bp as bp_wednesday
 from task_wednesday_evening  import bp as bp_wednesday_evening
 from task_thursday           import bp as bp_thursday
+from task_thursday_evening   import bp as bp_thursday_evening
 from task_friday             import bp as bp_friday
 from task_saturday           import bp as bp_saturday
 from task_sunday             import bp as bp_sunday
@@ -137,9 +150,11 @@ app.register_blueprint(bp_evening)
 app.register_blueprint(bp_monday)
 app.register_blueprint(bp_monday_evening)
 app.register_blueprint(bp_tuesday)
+app.register_blueprint(bp_tuesday_evening)
 app.register_blueprint(bp_wednesday)
 app.register_blueprint(bp_wednesday_evening)
 app.register_blueprint(bp_thursday)
+app.register_blueprint(bp_thursday_evening)
 app.register_blueprint(bp_friday)
 app.register_blueprint(bp_saturday)
 app.register_blueprint(bp_sunday)
