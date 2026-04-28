@@ -2,6 +2,7 @@ import azure.functions as func
 import logging
 import requests
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -54,13 +55,30 @@ def get_list_id(list_name: str) -> str | None:
     return LIST_IDS.get(list_name)
 
 
+def extract_list_id(resource: str) -> str | None:
+    # Why: Microsoft Graph delivers webhook notifications using an internal
+    # path format that differs from the standard REST path used when
+    # registering subscriptions. The standard format uses slash-separated
+    # segments (lists/{id}/tasks) but the internal format uses parentheses
+    # notation (lists('{id}')/tasks). A regex handles both formats without
+    # assumptions about path structure.
+    #
+    # Standard:  users/{id}/todo/lists/{listId}/tasks
+    # Internal:  todob2/graph/v1/users('{id}')/todoApp/lists('{listId}')/tasks
+    #
+    # The pattern matches 'lists' followed by either '/' or "('" then
+    # captures everything until the next quote, slash, or closing parenthesis.
+    match = re.search(r"lists(?:/|\(')([^'/\)]+)", resource)
+    return match.group(1) if match else None
+
+
 def get_recently_completed_tasks(token: str, list_id: str) -> list:
     # Why: Graph To Do webhooks notify at the list collection level — the
     # resource path ends in /tasks with no task ID appended. We therefore
     # cannot fetch a specific task by ID from the notification. Instead we
     # query the list for tasks completed in the last five minutes, which
-    # is a wide enough window to catch any task that triggered this
-    # notification without risking false positives from older completions.
+    # is wide enough to catch the task that triggered the notification
+    # without risking false positives from older completions.
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
@@ -179,19 +197,9 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
 
     for notification in notifications:
         resource = notification.get("resource", "")
+        logging.info(f"Processing notification resource: '{resource}'")
 
-        # Why: Strip a leading slash before splitting. Graph registers
-        # subscriptions with a leading slash in the resource path and echoes
-        # that same path back in notifications. Without stripping it, split("/")
-        # produces an empty string as the first element, which corrupts all
-        # subsequent index lookups.
-        parts = resource.lstrip("/").split("/")
-
-        list_id_from_resource = None
-        if "lists" in parts:
-            idx = parts.index("lists")
-            if idx + 1 < len(parts):
-                list_id_from_resource = parts[idx + 1]
+        list_id_from_resource = extract_list_id(resource)
 
         if not list_id_from_resource:
             logging.warning(f"Could not extract list ID from resource '{resource}' — skipping")
@@ -203,11 +211,6 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
 
         seen_list_ids.add(list_id_from_resource)
 
-        # Why: Query the list for recently completed tasks rather than
-        # attempting to fetch a task by ID. Graph To Do webhooks notify at
-        # the collection level (/tasks), not the individual task level
-        # (/tasks/{taskId}), so there is no task ID to extract from the
-        # resource path.
         completed_tasks = get_recently_completed_tasks(token, list_id_from_resource)
 
         if not completed_tasks:
