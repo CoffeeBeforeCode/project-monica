@@ -2,7 +2,7 @@ import azure.functions as func
 import logging
 import requests
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 # Why: Blueprint allows this function to live in its own file while still
@@ -54,6 +54,31 @@ def get_list_id(list_name: str) -> str | None:
     return LIST_IDS.get(list_name)
 
 
+def get_recently_completed_tasks(token: str, list_id: str) -> list:
+    # Why: Graph To Do webhooks notify at the list collection level — the
+    # resource path ends in /tasks with no task ID appended. We therefore
+    # cannot fetch a specific task by ID from the notification. Instead we
+    # query the list for tasks completed in the last five minutes, which
+    # is a wide enough window to catch any task that triggered this
+    # notification without risking false positives from older completions.
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{USER_ID}"
+        f"/todo/lists/{list_id}/tasks"
+        f"?$filter=status eq 'completed' and lastModifiedDateTime ge {cutoff}"
+    )
+    response = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+    if response.status_code != 200:
+        logging.warning(
+            f"Could not fetch completed tasks from list {list_id} "
+            f"({response.status_code}) — skipping"
+        )
+        return []
+    return response.json().get("value", [])
+
+
 def task_exists(token: str, list_id: str, title: str) -> bool:
     # Why: Prevents duplicate successor tasks. Graph often sends multiple
     # notifications for a single completion event. Scoped to today (London
@@ -88,10 +113,8 @@ def create_task(
     # to Graph so Dry tasks surface at the correct local time year-round
     # regardless of GMT/BST.
     body: dict = {"title": title}
-
     if category:
         body["categories"] = [category]
-
     if due_time:
         # Why: Parse due_time as London local time and convert to UTC.
         # "19:00" in task-chains.json means 19:00 on your clock — 18:00 UTC
@@ -105,7 +128,6 @@ def create_task(
             "dateTime": due_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.0000000"),
             "timeZone": "UTC"
         }
-
     url = (
         f"https://graph.microsoft.com/v1.0/users/{USER_ID}"
         f"/todo/lists/{list_id}/tasks"
@@ -152,12 +174,18 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
     chains = get_task_chains(token)
 
     # Why: Deduplicate by list ID within a single notification batch.
-    # Graph sometimes includes multiple notifications for the same list in one POST.
+    # Graph sometimes sends multiple notifications for the same list in one POST.
     seen_list_ids: set = set()
 
     for notification in notifications:
         resource = notification.get("resource", "")
-        parts    = resource.split("/")
+
+        # Why: Strip a leading slash before splitting. Graph registers
+        # subscriptions with a leading slash in the resource path and echoes
+        # that same path back in notifications. Without stripping it, split("/")
+        # produces an empty string as the first element, which corrupts all
+        # subsequent index lookups.
+        parts = resource.lstrip("/").split("/")
 
         list_id_from_resource = None
         if "lists" in parts:
@@ -165,58 +193,56 @@ def taskChain(req: func.HttpRequest) -> func.HttpResponse:
             if idx + 1 < len(parts):
                 list_id_from_resource = parts[idx + 1]
 
+        if not list_id_from_resource:
+            logging.warning(f"Could not extract list ID from resource '{resource}' — skipping")
+            continue
+
         if list_id_from_resource in seen_list_ids:
             logging.info(f"Duplicate notification for list {list_id_from_resource} — skipping")
             continue
-        if list_id_from_resource:
-            seen_list_ids.add(list_id_from_resource)
 
-        task_id = parts[-1] if parts else None
-        if not task_id:
-            logging.warning("Could not extract task ID from resource — skipping notification")
+        seen_list_ids.add(list_id_from_resource)
+
+        # Why: Query the list for recently completed tasks rather than
+        # attempting to fetch a task by ID. Graph To Do webhooks notify at
+        # the collection level (/tasks), not the individual task level
+        # (/tasks/{taskId}), so there is no task ID to extract from the
+        # resource path.
+        completed_tasks = get_recently_completed_tasks(token, list_id_from_resource)
+
+        if not completed_tasks:
+            logging.info(f"No recently completed tasks found in list {list_id_from_resource}")
             continue
 
-        task_url      = f"https://graph.microsoft.com/v1.0/{resource}"
-        task_response = requests.get(
-            task_url,
-            headers={"Authorization": f"Bearer {token}"}
-        )
-        if task_response.status_code != 200:
-            logging.warning(f"Could not fetch task {task_id} ({task_response.status_code}) — skipping")
-            continue
+        for task in completed_tasks:
+            completed_title = task.get("title", "")
+            logging.info(f"Completed task detected: '{completed_title}'")
 
-        task = task_response.json()
+            for chain in chains:
+                if chain.get("trigger_task") != completed_title:
+                    continue
 
-        if task.get("status") != "completed":
-            logging.info(f"Task '{task.get('title')}' updated but not completed — ignoring")
-            continue
+                successor_title  = chain.get("creates_task")
+                target_list_name = chain.get("list")
+                category         = chain.get("category")
+                due_time         = chain.get("due_time")
 
-        completed_title = task.get("title", "")
-        logging.info(f"Completed task detected: '{completed_title}'")
+                target_list_id = get_list_id(target_list_name)
+                if not target_list_id:
+                    logging.warning(
+                        f"List name '{target_list_name}' not found in LIST_IDS — skipping chain"
+                    )
+                    break
 
-        for chain in chains:
-            if chain.get("trigger_task") != completed_title:
-                continue
+                if task_exists(token, target_list_id, successor_title):
+                    logging.info(f"Successor '{successor_title}' already exists today — skipping")
+                    break
 
-            successor_title  = chain.get("creates_task")
-            target_list_name = chain.get("list")
-            category         = chain.get("category")
-            due_time         = chain.get("due_time")
-
-            target_list_id = get_list_id(target_list_name)
-            if not target_list_id:
-                logging.warning(f"List name '{target_list_name}' not found in LIST_IDS — skipping chain")
+                created = create_task(token, target_list_id, successor_title, category, due_time)
+                logging.info(
+                    f"Successor task created: '{created.get('title')}' "
+                    f"in list '{target_list_name}'"
+                )
                 break
-
-            if task_exists(token, target_list_id, successor_title):
-                logging.info(f"Successor '{successor_title}' already exists today — skipping")
-                break
-
-            created = create_task(token, target_list_id, successor_title, category, due_time)
-            logging.info(
-                f"Successor task created: '{created.get('title')}' "
-                f"in list '{target_list_name}'"
-            )
-            break
 
     return func.HttpResponse("OK", status_code=200)
