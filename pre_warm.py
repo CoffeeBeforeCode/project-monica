@@ -1,60 +1,50 @@
 import logging
 import azure.functions as func
 
-# Why: We define a Blueprint so this file follows the same pattern as every
-# other Monica function file (task_morning.py, task_guardian.py, etc.).
-# A Blueprint is a self-contained collection of triggers that function_app.py
-# imports and registers. This means one broken file can never take down the
-# others.
 bp_pre_warm = func.Blueprint()
 
-
 @bp_pre_warm.timer_trigger(
-    schedule="0 45 4 * * *",  # 04:45 UTC every day
+    schedule="0 45 3 * * *",  # 03:45 UTC every day — 15 minutes before 04:00 UTC (05:00 BST)
     arg_name="timer",
     run_on_startup=False,
     use_monitor=False,
 )
 def preWarm(timer: func.TimerRequest) -> None:
     """
-    Pre-warm check. Fires at 04:45 UTC — 15 minutes before the critical
-    05:00 task creation window.
+    Pre-warm check. Fires at 03:45 UTC — 15 minutes before the critical
+    04:00 UTC task creation and digest window (05:00 BST year-round).
 
     Why this exists
     ---------------
-    Azure Consumption plan hosts can be recycled by the platform at any time.
-    keepAlive (every 4 minutes) prevents cold starts caused by *inactivity*,
-    but cannot prevent a platform-initiated recycle. If the host is recycled
-    overnight, keepAlive will eventually wake it — but there is no guarantee
-    it will be fully warm by 05:00.
+    The Function App runs on a B1 Basic App Service Plan (always-on), but
+    the platform can still recycle the host overnight. If the host is recycled,
+    the Managed Identity sidecar at 169.254.129.3:8081 may not be ready when
+    the first functions fire at 04:00 UTC, causing token acquisition to time
+    out and all 04:00 UTC functions to exit silently with no tasks or digest.
 
-    preWarm solves this with an explicit pre-flight check:
-      - It fires at 04:45, waking the host if it has been recycled.
-      - It logs a clearly labelled Application Insights entry.
-      - If the 04:45 entry is present in the logs, you have confirmation the
-        host was alive before 05:00.
-      - If it is ABSENT, that absence is the diagnostic signal — the host was
-        still cold at 04:45, meaning the 05:00 window was at risk.
+    preWarm solves this by firing at 03:45 UTC — 15 minutes early — so the
+    host and sidecar are fully initialised before the 04:00 UTC window.
 
-    This pairs with taskGuardian (05:15) to give belt-and-braces coverage:
-      04:45  preWarm      → explicit wake-up and evidence of life
-      05:00  task creation → morning tasks created (should now reliably fire)
-      05:15  taskGuardian → verifies tasks are present; creates any that are
-                            missing and logs a recovery warning
+    Why 03:45 UTC and not 04:45 UTC
+    --------------------------------
+    During GMT, 05:00 London = 05:00 UTC. During BST, 05:00 London = 04:00 UTC.
+    The previous schedule of 04:45 UTC was 15 minutes early in GMT but
+    45 minutes late in BST — arriving after the functions it was meant to
+    protect had already failed. 03:45 UTC is 15 minutes early in both seasons.
+
+    Observability
+    -------------
+    PRE_WARM_OK  — host was alive and warm at 03:45 UTC
+    PRE_WARM_LATE — host was recycled; this fired past its scheduled time
     """
-
-    # Why use past_due: Azure tells us whether this trigger fired late.
-    # If the host was recycled and the 04:45 slot was missed, Azure will
-    # fire it as soon as the host recovers, setting past_due=True.
-    # We log this explicitly so it is visible in Application Insights.
     if timer.past_due:
         logging.warning(
             "PRE_WARM_LATE: preWarm fired past its scheduled time. "
-            "Host was not alive at 04:45 UTC. The 05:00 task window may "
-            "have been at risk. Check createMorningTasks and taskGuardian logs."
+            "Host was not alive at 03:45 UTC. The 04:00 UTC task window may "
+            "have been at risk. Check createMorningTasks and emailDigest0500 logs."
         )
     else:
         logging.info(
-            "PRE_WARM_OK: Host confirmed alive at 04:45 UTC. "
-            "05:00 task creation window is covered."
+            "PRE_WARM_OK: Host confirmed alive at 03:45 UTC. "
+            "04:00 UTC task creation and digest window is covered."
         )
